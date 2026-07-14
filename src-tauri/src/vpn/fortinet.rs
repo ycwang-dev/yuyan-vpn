@@ -789,174 +789,136 @@ pub async fn connect_fortinet(
         }
         let fortinet_config = load_vpn_config(app_handle.clone()).await?.fortinet;
         validate_vpn_connection_config("Fortinet", &fortinet_config)?;
-        return super::windows::connect_fortinet(
-            &app_handle,
-            state.inner(),
-            fortinet_config,
-            password,
-        )
-        .await;
+        super::windows::connect_fortinet(&app_handle, state.inner(), fortinet_config, password)
+            .await
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        return Err("当前操作系统暂不支持北京服务器 VPN 连接".to_string());
+        Err("当前操作系统暂不支持北京服务器 VPN 连接".to_string())
     }
+    #[cfg(target_os = "macos")]
+    {
+        state.inner().ensure_connections_allowed()?;
 
-    state.inner().ensure_connections_allowed()?;
-
-    if password.contains('\r') || password.contains('\n') {
-        return Err("北京服务器 VPN 密码不能包含换行符".to_string());
-    }
-
-    let openfortivpn_bin = resolve_macos_sidecar("openfortivpn")?;
-
-    if !openfortivpn_bin.is_file() {
-        return Err(format!(
-            "安装包缺少当前架构的 openfortivpn: {}",
-            openfortivpn_bin.display()
-        ));
-    }
-
-    let fortinet_config = load_vpn_config(app_handle.clone()).await?.fortinet;
-    validate_vpn_connection_config("Fortinet", &fortinet_config)?;
-    let host = fortinet_config.host.clone();
-    let port = fortinet_config.port;
-    let username = fortinet_config.username.clone();
-    let custom_routes = fortinet_config.custom_routes;
-
-    let sudo_password = {
-        let mut inner = state.inner.lock().await;
-        if matches!(
-            inner.fortinet_status,
-            VpnStatus::Connecting | VpnStatus::Connected
-        ) {
-            return Err("北京服务器 VPN 已经连接或正在连接中".to_string());
+        if password.contains('\r') || password.contains('\n') {
+            return Err("北京服务器 VPN 密码不能包含换行符".to_string());
         }
-        let sudo_password = inner
-            .sudo_password
-            .clone()
-            .ok_or("请先验证 macOS 系统权限")?;
-        inner.fortinet_status = VpnStatus::Connecting;
-        inner.fortinet_start_time = Some(std::time::Instant::now());
-        inner.fortinet_ip = None;
-        inner.fortinet_gateway_host = None;
-        sudo_password
-    };
-    // 清理由旧版本或异常退出遗留的无限重连进程，避免与本次 PPP 会话争用。
-    let _ = run_sudo_command(&sudo_password, "killall", &["openfortivpn"]).await;
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    if let Err(error) = state.inner().ensure_connections_allowed() {
-        mark_start_error(&state).await;
-        return Err(error);
-    }
 
-    let primary_network = match get_primary_network_state().await {
-        Ok(network) => network,
-        Err(error) => {
+        let openfortivpn_bin = resolve_macos_sidecar("openfortivpn")?;
+
+        if !openfortivpn_bin.is_file() {
+            return Err(format!(
+                "安装包缺少当前架构的 openfortivpn: {}",
+                openfortivpn_bin.display()
+            ));
+        }
+
+        let fortinet_config = load_vpn_config(app_handle.clone()).await?.fortinet;
+        validate_vpn_connection_config("Fortinet", &fortinet_config)?;
+        let host = fortinet_config.host.clone();
+        let port = fortinet_config.port;
+        let username = fortinet_config.username.clone();
+        let custom_routes = fortinet_config.custom_routes;
+
+        let sudo_password = {
+            let mut inner = state.inner.lock().await;
+            if matches!(
+                inner.fortinet_status,
+                VpnStatus::Connecting | VpnStatus::Connected
+            ) {
+                return Err("北京服务器 VPN 已经连接或正在连接中".to_string());
+            }
+            let sudo_password = inner
+                .sudo_password
+                .clone()
+                .ok_or("请先验证 macOS 系统权限")?;
+            inner.fortinet_status = VpnStatus::Connecting;
+            inner.fortinet_start_time = Some(std::time::Instant::now());
+            inner.fortinet_ip = None;
+            inner.fortinet_gateway_host = None;
+            sudo_password
+        };
+        // 清理由旧版本或异常退出遗留的无限重连进程，避免与本次 PPP 会话争用。
+        let _ = run_sudo_command(&sudo_password, "killall", &["openfortivpn"]).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if let Err(error) = state.inner().ensure_connections_allowed() {
             mark_start_error(&state).await;
             return Err(error);
         }
-    };
-    let existing_ppp_interfaces = list_ppp_interfaces().await;
 
-    let gateway_route_target =
-        match ensure_gateway_route(&sudo_password, &host, &primary_network).await {
-            Ok(GatewayRouteOutcome::Added(route_target)) => Some(route_target),
-            Ok(GatewayRouteOutcome::ProxyManaged) => {
-                emit_vpn_log(
-                    &app_handle,
-                    VpnType::Fortinet,
-                    "检测到 Mihomo Fake-IP，保留 TUN 接管 VPN 网关连接",
-                );
-                None
-            }
-            Ok(GatewayRouteOutcome::Unchanged) => None,
+        let primary_network = match get_primary_network_state().await {
+            Ok(network) => network,
             Err(error) => {
                 mark_start_error(&state).await;
                 return Err(error);
             }
         };
-    if let Some(route_target) = gateway_route_target.as_ref() {
-        state.inner.lock().await.fortinet_gateway_host = Some(route_target.clone());
-    }
+        let existing_ppp_interfaces = list_ppp_interfaces().await;
 
-    if let Err(error) = verify_gateway_reachable(&host, port).await {
+        let gateway_route_target =
+            match ensure_gateway_route(&sudo_password, &host, &primary_network).await {
+                Ok(GatewayRouteOutcome::Added(route_target)) => Some(route_target),
+                Ok(GatewayRouteOutcome::ProxyManaged) => {
+                    emit_vpn_log(
+                        &app_handle,
+                        VpnType::Fortinet,
+                        "检测到 Mihomo Fake-IP，保留 TUN 接管 VPN 网关连接",
+                    );
+                    None
+                }
+                Ok(GatewayRouteOutcome::Unchanged) => None,
+                Err(error) => {
+                    mark_start_error(&state).await;
+                    return Err(error);
+                }
+            };
         if let Some(route_target) = gateway_route_target.as_ref() {
-            remove_gateway_route(&sudo_password, route_target).await;
+            state.inner.lock().await.fortinet_gateway_host = Some(route_target.clone());
         }
-        state.inner.lock().await.fortinet_gateway_host = None;
-        mark_start_error(&state).await;
-        return Err(error);
-    }
 
-    let mihomo_state = match pin_mihomo_interface(&primary_network.interface).await {
-        Ok(state) => state,
-        Err(error) => {
+        if let Err(error) = verify_gateway_reachable(&host, port).await {
             if let Some(route_target) = gateway_route_target.as_ref() {
                 remove_gateway_route(&sudo_password, route_target).await;
             }
             state.inner.lock().await.fortinet_gateway_host = None;
             mark_start_error(&state).await;
-            return Err(format!("固定公网代理出口失败: {error}"));
+            return Err(error);
         }
-    };
-    state.inner.lock().await.fortinet_mihomo_state = mihomo_state;
 
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let temp_config_path = std::env::temp_dir().join(format!("openfortivpn-{timestamp}.conf"));
-    let config = format!(
+        let mihomo_state = match pin_mihomo_interface(&primary_network.interface).await {
+            Ok(state) => state,
+            Err(error) => {
+                if let Some(route_target) = gateway_route_target.as_ref() {
+                    remove_gateway_route(&sudo_password, route_target).await;
+                }
+                state.inner.lock().await.fortinet_gateway_host = None;
+                mark_start_error(&state).await;
+                return Err(format!("固定公网代理出口失败: {error}"));
+            }
+        };
+        state.inner.lock().await.fortinet_mihomo_state = mihomo_state;
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let temp_config_path = std::env::temp_dir().join(format!("openfortivpn-{timestamp}.conf"));
+        let config = format!(
         "host = {host}\nport = {port}\nusername = {username}\npassword = {password}\ntrusted-cert = 491a5bbe4cc44c3e42141d9babfbdd29eee75aaf36401221a1dac9305c846b56\ninsecure-ssl = 1\n"
     );
-    if let Err(error) = write_secure_config(&temp_config_path, config.as_bytes()) {
-        if let Some(route_target) = gateway_route_target.as_ref() {
-            remove_gateway_route(&sudo_password, route_target).await;
+        if let Err(error) = write_secure_config(&temp_config_path, config.as_bytes()) {
+            if let Some(route_target) = gateway_route_target.as_ref() {
+                remove_gateway_route(&sudo_password, route_target).await;
+            }
+            state.inner.lock().await.fortinet_gateway_host = None;
+            let mihomo_state = state.inner.lock().await.fortinet_mihomo_state.take();
+            restore_mihomo_interface(mihomo_state).await;
+            mark_start_error(&state).await;
+            return Err(format!("写入 Fortinet 临时配置失败: {error}"));
         }
-        state.inner.lock().await.fortinet_gateway_host = None;
-        let mihomo_state = state.inner.lock().await.fortinet_mihomo_state.take();
-        restore_mihomo_interface(mihomo_state).await;
-        mark_start_error(&state).await;
-        return Err(format!("写入 Fortinet 临时配置失败: {error}"));
-    }
-    state.inner.lock().await.fortinet_config_path = Some(temp_config_path.clone());
+        state.inner.lock().await.fortinet_config_path = Some(temp_config_path.clone());
 
-    if let Err(error) = state.inner().ensure_connections_allowed() {
-        let _ = std::fs::remove_file(&temp_config_path);
-        state.inner.lock().await.fortinet_config_path = None;
-        if let Some(route_target) = gateway_route_target.as_ref() {
-            remove_gateway_route(&sudo_password, route_target).await;
-        }
-        let mihomo_state = state.inner.lock().await.fortinet_mihomo_state.take();
-        restore_mihomo_interface(mihomo_state).await;
-        mark_start_error(&state).await;
-        return Err(error);
-    }
-
-    let mut command = tokio::process::Command::new("sudo");
-    command
-        .arg("-S")
-        .arg("-p")
-        .arg("")
-        .arg(&openfortivpn_bin)
-        .arg("-c")
-        .arg(&temp_config_path)
-        .arg("--no-routes")
-        .arg("--no-dns")
-        .arg("--pppd-no-peerdns")
-        .arg("--min-tls=1.0")
-        .arg("--cipher-list=DHE-RSA-AES256-SHA:@SECLEVEL=0")
-        .arg("-v")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    command.process_group(0);
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
+        if let Err(error) = state.inner().ensure_connections_allowed() {
             let _ = std::fs::remove_file(&temp_config_path);
             state.inner.lock().await.fortinet_config_path = None;
             if let Some(route_target) = gateway_route_target.as_ref() {
@@ -965,177 +927,212 @@ pub async fn connect_fortinet(
             let mihomo_state = state.inner.lock().await.fortinet_mihomo_state.take();
             restore_mihomo_interface(mihomo_state).await;
             mark_start_error(&state).await;
-            return Err(format!("无法拉起内置 openfortivpn: {error}"));
+            return Err(error);
         }
-    };
 
-    if let Err(error) = state.inner().ensure_connections_allowed() {
-        if let Some(process_id) = child.id() {
-            terminate_managed_process_group(&sudo_password, process_id).await;
-        }
-        let _ = child.kill().await;
-        let _ = std::fs::remove_file(&temp_config_path);
-        state.inner.lock().await.fortinet_config_path = None;
-        if let Some(route_target) = gateway_route_target.as_ref() {
-            remove_gateway_route(&sudo_password, route_target).await;
-        }
-        let mihomo_state = state.inner.lock().await.fortinet_mihomo_state.take();
-        restore_mihomo_interface(mihomo_state).await;
-        mark_start_error(&state).await;
-        return Err(error);
-    }
+        let mut command = tokio::process::Command::new("sudo");
+        command
+            .arg("-S")
+            .arg("-p")
+            .arg("")
+            .arg(&openfortivpn_bin)
+            .arg("-c")
+            .arg(&temp_config_path)
+            .arg("--no-routes")
+            .arg("--no-dns")
+            .arg("--pppd-no-peerdns")
+            .arg("--min-tls=1.0")
+            .arg("--cipher-list=DHE-RSA-AES256-SHA:@SECLEVEL=0")
+            .arg("-v")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        command.process_group(0);
 
-    let stdin_result = match child.stdin.take() {
-        Some(mut stdin) => {
-            stdin
-                .write_all(format!("{sudo_password}\n").as_bytes())
-                .await
-        }
-        None => Err(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "无法打开 openfortivpn stdin",
-        )),
-    };
-    if let Err(error) = stdin_result {
-        let _ = child.kill().await;
-        let _ = std::fs::remove_file(&temp_config_path);
-        state.inner.lock().await.fortinet_config_path = None;
-        if let Some(route_target) = gateway_route_target.as_ref() {
-            remove_gateway_route(&sudo_password, route_target).await;
-        }
-        let mihomo_state = state.inner.lock().await.fortinet_mihomo_state.take();
-        restore_mihomo_interface(mihomo_state).await;
-        mark_start_error(&state).await;
-        return Err(format!("向 sudo 写入凭据失败: {error}"));
-    }
-
-    let (stdout, stderr) = match (child.stdout.take(), child.stderr.take()) {
-        (Some(stdout), Some(stderr)) => (stdout, stderr),
-        _ => {
-            let _ = child.kill().await;
-            let _ = std::fs::remove_file(&temp_config_path);
-            state.inner.lock().await.fortinet_config_path = None;
-            if let Some(route_target) = gateway_route_target.as_ref() {
-                remove_gateway_route(&sudo_password, route_target).await;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = std::fs::remove_file(&temp_config_path);
+                state.inner.lock().await.fortinet_config_path = None;
+                if let Some(route_target) = gateway_route_target.as_ref() {
+                    remove_gateway_route(&sudo_password, route_target).await;
+                }
+                let mihomo_state = state.inner.lock().await.fortinet_mihomo_state.take();
+                restore_mihomo_interface(mihomo_state).await;
+                mark_start_error(&state).await;
+                return Err(format!("无法拉起内置 openfortivpn: {error}"));
             }
-            let mihomo_state = state.inner.lock().await.fortinet_mihomo_state.take();
-            restore_mihomo_interface(mihomo_state).await;
-            mark_start_error(&state).await;
-            return Err("无法读取内置 openfortivpn 日志".to_string());
-        }
-    };
-
-    let network_watcher = tokio::spawn(maintain_split_network(
-        sudo_password.clone(),
-        existing_ppp_interfaces,
-        custom_routes,
-        primary_network,
-        host.clone(),
-        state.inner.clone(),
-        app_handle.clone(),
-    ));
-
-    let manager = state.inner.clone();
-    let watcher_app = app_handle.clone();
-    let cleanup_password = sudo_password.clone();
-    let temp_config_cleanup = temp_config_path.clone();
-    let watcher = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        let _ = tokio::fs::remove_file(&temp_config_cleanup).await;
-        {
-            let mut inner = manager.lock().await;
-            if inner.fortinet_config_path.as_ref() == Some(&temp_config_cleanup) {
-                inner.fortinet_config_path = None;
-            }
-        }
-
-        tokio::join!(
-            forward_logs(stdout, watcher_app.clone()),
-            forward_logs(stderr, watcher_app.clone())
-        );
-
-        let (exit_status, gateway_host) = {
-            let mut inner = manager.lock().await;
-            let exit_status = if inner.fortinet_status == VpnStatus::Disconnecting {
-                VpnStatus::Disconnected
-            } else {
-                VpnStatus::Error
-            };
-            inner.fortinet_status = exit_status;
-            inner.fortinet_ip = None;
-            inner.fortinet_start_time = None;
-            inner.fortinet_child = None;
-            if let Some(network_watcher) = inner.fortinet_network_watcher.take() {
-                network_watcher.abort();
-            }
-            (exit_status, inner.fortinet_gateway_host.take())
         };
 
-        if let Some(gateway_host) = gateway_host {
-            remove_gateway_route(&cleanup_password, &gateway_host).await;
-        }
-        let mihomo_state = manager.lock().await.fortinet_mihomo_state.take();
-        restore_mihomo_interface(mihomo_state).await;
-        emit_status(
-            &watcher_app,
-            exit_status,
-            if exit_status == VpnStatus::Error {
-                "北京服务器 VPN 进程意外退出，请检查日志"
-            } else {
-                "已断开"
-            },
-            None,
-        );
-    });
-
-    let mut child = Some(child);
-    let mut watcher = Some(watcher);
-    let mut network_watcher = Some(network_watcher);
-    let should_abort_for_shutdown = {
-        let mut inner = state.inner.lock().await;
-        if state.inner().is_shutting_down() {
-            true
-        } else {
-            inner.fortinet_child = child.take();
-            inner.fortinet_watcher = watcher.take();
-            inner.fortinet_network_watcher = network_watcher.take();
-            false
-        }
-    };
-
-    if should_abort_for_shutdown {
-        if let Some(watcher) = watcher {
-            watcher.abort();
-        }
-        if let Some(network_watcher) = network_watcher {
-            network_watcher.abort();
-        }
-        if let Some(mut child) = child {
+        if let Err(error) = state.inner().ensure_connections_allowed() {
             if let Some(process_id) = child.id() {
                 terminate_managed_process_group(&sudo_password, process_id).await;
             }
             let _ = child.kill().await;
+            let _ = std::fs::remove_file(&temp_config_path);
+            state.inner.lock().await.fortinet_config_path = None;
+            if let Some(route_target) = gateway_route_target.as_ref() {
+                remove_gateway_route(&sudo_password, route_target).await;
+            }
+            let mihomo_state = state.inner.lock().await.fortinet_mihomo_state.take();
+            restore_mihomo_interface(mihomo_state).await;
+            mark_start_error(&state).await;
+            return Err(error);
         }
-        let _ = tokio::fs::remove_file(&temp_config_path).await;
-        let (gateway_target, mihomo_state) = {
-            let mut inner = state.inner.lock().await;
-            inner.fortinet_config_path = None;
-            inner.fortinet_status = VpnStatus::Disconnected;
-            inner.fortinet_start_time = None;
-            inner.fortinet_ip = None;
-            (
-                inner.fortinet_gateway_host.take(),
-                inner.fortinet_mihomo_state.take(),
-            )
-        };
-        if let Some(gateway_target) = gateway_target {
-            remove_gateway_route(&sudo_password, &gateway_target).await;
-        }
-        restore_mihomo_interface(mihomo_state).await;
-        return Err("应用正在安全退出，已回收 Fortinet 连接进程".to_string());
-    }
 
-    Ok(())
+        let stdin_result = match child.stdin.take() {
+            Some(mut stdin) => {
+                stdin
+                    .write_all(format!("{sudo_password}\n").as_bytes())
+                    .await
+            }
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "无法打开 openfortivpn stdin",
+            )),
+        };
+        if let Err(error) = stdin_result {
+            let _ = child.kill().await;
+            let _ = std::fs::remove_file(&temp_config_path);
+            state.inner.lock().await.fortinet_config_path = None;
+            if let Some(route_target) = gateway_route_target.as_ref() {
+                remove_gateway_route(&sudo_password, route_target).await;
+            }
+            let mihomo_state = state.inner.lock().await.fortinet_mihomo_state.take();
+            restore_mihomo_interface(mihomo_state).await;
+            mark_start_error(&state).await;
+            return Err(format!("向 sudo 写入凭据失败: {error}"));
+        }
+
+        let (stdout, stderr) = match (child.stdout.take(), child.stderr.take()) {
+            (Some(stdout), Some(stderr)) => (stdout, stderr),
+            _ => {
+                let _ = child.kill().await;
+                let _ = std::fs::remove_file(&temp_config_path);
+                state.inner.lock().await.fortinet_config_path = None;
+                if let Some(route_target) = gateway_route_target.as_ref() {
+                    remove_gateway_route(&sudo_password, route_target).await;
+                }
+                let mihomo_state = state.inner.lock().await.fortinet_mihomo_state.take();
+                restore_mihomo_interface(mihomo_state).await;
+                mark_start_error(&state).await;
+                return Err("无法读取内置 openfortivpn 日志".to_string());
+            }
+        };
+
+        let network_watcher = tokio::spawn(maintain_split_network(
+            sudo_password.clone(),
+            existing_ppp_interfaces,
+            custom_routes,
+            primary_network,
+            host.clone(),
+            state.inner.clone(),
+            app_handle.clone(),
+        ));
+
+        let manager = state.inner.clone();
+        let watcher_app = app_handle.clone();
+        let cleanup_password = sudo_password.clone();
+        let temp_config_cleanup = temp_config_path.clone();
+        let watcher = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let _ = tokio::fs::remove_file(&temp_config_cleanup).await;
+            {
+                let mut inner = manager.lock().await;
+                if inner.fortinet_config_path.as_ref() == Some(&temp_config_cleanup) {
+                    inner.fortinet_config_path = None;
+                }
+            }
+
+            tokio::join!(
+                forward_logs(stdout, watcher_app.clone()),
+                forward_logs(stderr, watcher_app.clone())
+            );
+
+            let (exit_status, gateway_host) = {
+                let mut inner = manager.lock().await;
+                let exit_status = if inner.fortinet_status == VpnStatus::Disconnecting {
+                    VpnStatus::Disconnected
+                } else {
+                    VpnStatus::Error
+                };
+                inner.fortinet_status = exit_status;
+                inner.fortinet_ip = None;
+                inner.fortinet_start_time = None;
+                inner.fortinet_child = None;
+                if let Some(network_watcher) = inner.fortinet_network_watcher.take() {
+                    network_watcher.abort();
+                }
+                (exit_status, inner.fortinet_gateway_host.take())
+            };
+
+            if let Some(gateway_host) = gateway_host {
+                remove_gateway_route(&cleanup_password, &gateway_host).await;
+            }
+            let mihomo_state = manager.lock().await.fortinet_mihomo_state.take();
+            restore_mihomo_interface(mihomo_state).await;
+            emit_status(
+                &watcher_app,
+                exit_status,
+                if exit_status == VpnStatus::Error {
+                    "北京服务器 VPN 进程意外退出，请检查日志"
+                } else {
+                    "已断开"
+                },
+                None,
+            );
+        });
+
+        let mut child = Some(child);
+        let mut watcher = Some(watcher);
+        let mut network_watcher = Some(network_watcher);
+        let should_abort_for_shutdown = {
+            let mut inner = state.inner.lock().await;
+            if state.inner().is_shutting_down() {
+                true
+            } else {
+                inner.fortinet_child = child.take();
+                inner.fortinet_watcher = watcher.take();
+                inner.fortinet_network_watcher = network_watcher.take();
+                false
+            }
+        };
+
+        if should_abort_for_shutdown {
+            if let Some(watcher) = watcher {
+                watcher.abort();
+            }
+            if let Some(network_watcher) = network_watcher {
+                network_watcher.abort();
+            }
+            if let Some(mut child) = child {
+                if let Some(process_id) = child.id() {
+                    terminate_managed_process_group(&sudo_password, process_id).await;
+                }
+                let _ = child.kill().await;
+            }
+            let _ = tokio::fs::remove_file(&temp_config_path).await;
+            let (gateway_target, mihomo_state) = {
+                let mut inner = state.inner.lock().await;
+                inner.fortinet_config_path = None;
+                inner.fortinet_status = VpnStatus::Disconnected;
+                inner.fortinet_start_time = None;
+                inner.fortinet_ip = None;
+                (
+                    inner.fortinet_gateway_host.take(),
+                    inner.fortinet_mihomo_state.take(),
+                )
+            };
+            if let Some(gateway_target) = gateway_target {
+                remove_gateway_route(&sudo_password, &gateway_target).await;
+            }
+            restore_mihomo_interface(mihomo_state).await;
+            return Err("应用正在安全退出，已回收 Fortinet 连接进程".to_string());
+        }
+
+        Ok(())
+    }
 }
 
 /** 断开北京 Fortinet VPN，并清理本次添加的网关路由与临时配置。 */
@@ -1145,65 +1142,75 @@ pub async fn disconnect_fortinet_managed(
 ) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        return super::windows::disconnect(app_handle, manager, VpnType::Fortinet).await;
+        super::windows::disconnect(app_handle, manager, VpnType::Fortinet).await
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (app_handle, manager);
-        return Err("当前操作系统暂不支持 Fortinet VPN 断开".to_string());
+        Err("当前操作系统暂不支持 Fortinet VPN 断开".to_string())
     }
-
-    let (child, watcher, network_watcher, sudo_password, gateway_host, mihomo_state, config_path) = {
-        let mut inner = manager.inner.lock().await;
-        let sudo_password = inner
-            .sudo_password
-            .clone()
-            .ok_or("断开北京服务器 VPN 前需要重新验证 macOS 系统权限")?;
-        inner.fortinet_status = VpnStatus::Disconnecting;
-        (
-            inner.fortinet_child.take(),
-            inner.fortinet_watcher.take(),
-            inner.fortinet_network_watcher.take(),
-            sudo_password,
-            inner.fortinet_gateway_host.take(),
-            inner.fortinet_mihomo_state.take(),
-            inner.fortinet_config_path.take(),
-        )
-    };
-
-    let has_managed_child = child.is_some();
-    if let Some(mut child) = child {
-        if let Some(process_id) = child.id() {
-            terminate_managed_process_group(&sudo_password, process_id).await;
-        }
-        let _ = child.kill().await;
-    }
-    if let Some(watcher) = watcher {
-        watcher.abort();
-    }
-    if let Some(network_watcher) = network_watcher {
-        network_watcher.abort();
-    }
-    if let Some(config_path) = config_path {
-        let _ = tokio::fs::remove_file(config_path).await;
-    }
-
-    if !has_managed_child {
-        let _ = run_sudo_command(&sudo_password, "killall", &["openfortivpn"]).await;
-    }
-    if let Some(gateway_host) = gateway_host {
-        remove_gateway_route(&sudo_password, &gateway_host).await;
-    }
-    restore_mihomo_interface(mihomo_state).await;
-
+    #[cfg(target_os = "macos")]
     {
-        let mut inner = manager.inner.lock().await;
-        inner.fortinet_status = VpnStatus::Disconnected;
-        inner.fortinet_ip = None;
-        inner.fortinet_start_time = None;
+        let (
+            child,
+            watcher,
+            network_watcher,
+            sudo_password,
+            gateway_host,
+            mihomo_state,
+            config_path,
+        ) = {
+            let mut inner = manager.inner.lock().await;
+            let sudo_password = inner
+                .sudo_password
+                .clone()
+                .ok_or("断开北京服务器 VPN 前需要重新验证 macOS 系统权限")?;
+            inner.fortinet_status = VpnStatus::Disconnecting;
+            (
+                inner.fortinet_child.take(),
+                inner.fortinet_watcher.take(),
+                inner.fortinet_network_watcher.take(),
+                sudo_password,
+                inner.fortinet_gateway_host.take(),
+                inner.fortinet_mihomo_state.take(),
+                inner.fortinet_config_path.take(),
+            )
+        };
+
+        let has_managed_child = child.is_some();
+        if let Some(mut child) = child {
+            if let Some(process_id) = child.id() {
+                terminate_managed_process_group(&sudo_password, process_id).await;
+            }
+            let _ = child.kill().await;
+        }
+        if let Some(watcher) = watcher {
+            watcher.abort();
+        }
+        if let Some(network_watcher) = network_watcher {
+            network_watcher.abort();
+        }
+        if let Some(config_path) = config_path {
+            let _ = tokio::fs::remove_file(config_path).await;
+        }
+
+        if !has_managed_child {
+            let _ = run_sudo_command(&sudo_password, "killall", &["openfortivpn"]).await;
+        }
+        if let Some(gateway_host) = gateway_host {
+            remove_gateway_route(&sudo_password, &gateway_host).await;
+        }
+        restore_mihomo_interface(mihomo_state).await;
+
+        {
+            let mut inner = manager.inner.lock().await;
+            inner.fortinet_status = VpnStatus::Disconnected;
+            inner.fortinet_ip = None;
+            inner.fortinet_start_time = None;
+        }
+        emit_status(app_handle, VpnStatus::Disconnected, "已断开", None);
+        Ok(())
     }
-    emit_status(app_handle, VpnStatus::Disconnected, "已断开", None);
-    Ok(())
 }
 
 /** 提供给前端的北京 Fortinet 断开命令。 */

@@ -4,7 +4,6 @@ use super::ipc::{
 use crate::vpn::{VpnConfig, VpnStatus, VpnType};
 use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -23,7 +22,7 @@ use windows_sys::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, WaitForSingleObject, CREATE_NEW_PROCESS_GROUP, INFINITE, SYNCHRONIZE,
+    OpenProcess, WaitForSingleObject, CREATE_NEW_PROCESS_GROUP, INFINITE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
 
@@ -31,6 +30,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 /** helper 最多保留的增量日志条数。 */
 const MAX_LOG_LINES: usize = 1000;
+/** 仅等待父进程退出所需的 Windows 进程同步访问权限。 */
+const PROCESS_SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 /** Windows Fortinet 候选引擎固定的 Wintun 适配器名。 */
 const FORTINET_INTERFACE: &str = "openfortivpn";
 /** Windows zju-connect 固定创建的 Wintun 适配器名。 */
@@ -239,7 +240,7 @@ fn initialize_hidden_console() {
 
 /** 监控普通权限 UI 父进程；父进程消失后立即关闭 helper 与 Job Object。 */
 fn monitor_parent(parent_pid: u32, sender: tokio::sync::oneshot::Sender<()>) -> Result<(), String> {
-    let process = unsafe { OpenProcess(SYNCHRONIZE, 0, parent_pid) };
+    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE_ACCESS, 0, parent_pid) };
     if process.is_null() {
         return Err(format!(
             "无法监控 Windows UI 父进程: {}",

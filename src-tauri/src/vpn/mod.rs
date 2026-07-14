@@ -602,13 +602,13 @@ pub async fn verify_sudo_password(
     {
         let _ = password;
         windows::ensure_helper(state.inner()).await?;
-        return Ok(true);
+        Ok(true)
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (state, password);
-        return Err("当前操作系统不支持 VPN 管理员授权".to_string());
+        Err("当前操作系统不支持 VPN 管理员授权".to_string())
     }
 
     #[cfg(target_os = "macos")]
@@ -648,9 +648,12 @@ pub async fn verify_sudo_password(
 pub async fn has_sudo_credentials(state: State<'_, VpnManager>) -> Result<bool, String> {
     #[cfg(target_os = "windows")]
     {
-        return Ok(windows::helper_is_available(state.inner()).await);
+        Ok(windows::helper_is_available(state.inner()).await)
     }
-    Ok(state.inner.lock().await.sudo_password.is_some())
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(state.inner.lock().await.sudo_password.is_some())
+    }
 }
 
 #[tauri::command]
@@ -705,13 +708,13 @@ pub struct VpnAuthPayload {
 pub async fn submit_vpn_mfa(state: State<'_, VpnManager>, code: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        return windows::submit_mfa(state.inner(), code).await;
+        windows::submit_mfa(state.inner(), code).await
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (state, code);
-        return Err("当前操作系统不支持 VPN 二次认证".to_string());
+        Err("当前操作系统不支持 VPN 二次认证".to_string())
     }
 
     #[cfg(target_os = "macos")]
