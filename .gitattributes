@@ -1,1 +1,1 @@
-scripts/patches/*.patch -whitespace
+scripts/patches/*.patch text eol=lf -whitespace
