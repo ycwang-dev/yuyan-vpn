@@ -319,7 +319,14 @@ pub async fn connect_atrust(
     state: tauri::State<'_, VpnManager>,
     password: String,
 ) -> Result<(), String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let atrust_config = load_vpn_config(app_handle.clone()).await?.atrust;
+        validate_vpn_connection_config("aTrust", &atrust_config)?;
+        return super::windows::connect_atrust(&app_handle, state.inner(), atrust_config, password)
+            .await;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         return Err("当前操作系统暂不支持 aTrust VPN 连接".to_string());
     }
@@ -683,6 +690,16 @@ pub async fn disconnect_atrust_managed(
     app_handle: &AppHandle,
     manager: &VpnManager,
 ) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        return super::windows::disconnect(app_handle, manager, VpnType::Atrust).await;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (app_handle, manager);
+        return Err("当前操作系统暂不支持 aTrust VPN 断开".to_string());
+    }
+
     let (child, watcher, readiness_watcher, fifo_path, sudo_pass) = {
         let mut inner = manager.inner.lock().await;
         let sudo_pass = inner

@@ -782,7 +782,22 @@ pub async fn connect_fortinet(
     state: tauri::State<'_, VpnManager>,
     password: String,
 ) -> Result<(), String> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        if password.contains('\r') || password.contains('\n') {
+            return Err("北京服务器 VPN 密码不能包含换行符".to_string());
+        }
+        let fortinet_config = load_vpn_config(app_handle.clone()).await?.fortinet;
+        validate_vpn_connection_config("Fortinet", &fortinet_config)?;
+        return super::windows::connect_fortinet(
+            &app_handle,
+            state.inner(),
+            fortinet_config,
+            password,
+        )
+        .await;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         return Err("当前操作系统暂不支持北京服务器 VPN 连接".to_string());
     }
@@ -1128,6 +1143,16 @@ pub async fn disconnect_fortinet_managed(
     app_handle: &AppHandle,
     manager: &VpnManager,
 ) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        return super::windows::disconnect(app_handle, manager, VpnType::Fortinet).await;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (app_handle, manager);
+        return Err("当前操作系统暂不支持 Fortinet VPN 断开".to_string());
+    }
+
     let (child, watcher, network_watcher, sudo_password, gateway_host, mihomo_state, config_path) = {
         let mut inner = manager.inner.lock().await;
         let sudo_password = inner

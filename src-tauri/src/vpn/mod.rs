@@ -10,6 +10,8 @@ pub mod atrust;
 pub mod fortinet;
 mod network_guard;
 pub mod shutdown;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 /** 空闲期间持续恢复异常退出或 Clash 重载后遗留的 Mihomo 静态出口。 */
 pub async fn maintain_idle_network_state(manager: VpnManager) {
@@ -291,12 +293,26 @@ pub struct VpnManagerInner {
     pub atrust_stack_ready: bool,
     pub atrust_fifo_path: Option<std::path::PathBuf>,
     pub atrust_readiness_watcher: Option<tokio::task::JoinHandle<()>>,
+
+    // Windows UAC helper 会话；不保存或伪造 Windows 登录密码。
+    #[cfg(target_os = "windows")]
+    pub windows_helper_pipe: Option<String>,
+    #[cfg(target_os = "windows")]
+    pub windows_helper_token: Option<String>,
+    #[cfg(target_os = "windows")]
+    pub windows_log_sequence: u64,
+    #[cfg(target_os = "windows")]
+    pub windows_auth_sequence: u64,
 }
 
 #[derive(Clone)]
 pub struct VpnManager {
     pub inner: Arc<Mutex<VpnManagerInner>>,
     shutting_down: Arc<AtomicBool>,
+    #[cfg(target_os = "windows")]
+    windows_helper_start_lock: Arc<Mutex<()>>,
+    #[cfg(target_os = "windows")]
+    windows_request_lock: Arc<Mutex<()>>,
 }
 
 impl VpnManager {
@@ -325,8 +341,20 @@ impl VpnManager {
                 atrust_stack_ready: false,
                 atrust_fifo_path: None,
                 atrust_readiness_watcher: None,
+                #[cfg(target_os = "windows")]
+                windows_helper_pipe: None,
+                #[cfg(target_os = "windows")]
+                windows_helper_token: None,
+                #[cfg(target_os = "windows")]
+                windows_log_sequence: 0,
+                #[cfg(target_os = "windows")]
+                windows_auth_sequence: 0,
             })),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_os = "windows")]
+            windows_helper_start_lock: Arc::new(Mutex::new(())),
+            #[cfg(target_os = "windows")]
+            windows_request_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -570,46 +598,70 @@ pub async fn verify_sudo_password(
     state: State<'_, VpnManager>,
     password: String,
 ) -> Result<bool, String> {
-    // 通过跑一个简单的 sudo -S id 命令来验证密码是否正确
-    let mut child = tokio::process::Command::new("sudo")
-        .arg("-S")
-        .arg("id")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("无法启动提权验证进程: {e}"))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        let _ = stdin.write_all(format!("{password}\n").as_bytes()).await;
+    #[cfg(target_os = "windows")]
+    {
+        let _ = password;
+        windows::ensure_helper(state.inner()).await?;
+        return Ok(true);
     }
 
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("提权进程执行错误: {e}"))?;
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (state, password);
+        return Err("当前操作系统不支持 VPN 管理员授权".to_string());
+    }
 
-    if output.status.success() {
-        let mut inner = state.inner.lock().await;
-        inner.sudo_password = Some(password);
-        Ok(true)
-    } else {
-        Ok(false)
+    #[cfg(target_os = "macos")]
+    {
+        // 通过跑一个简单的 sudo -S id 命令来验证密码是否正确
+        let mut child = tokio::process::Command::new("sudo")
+            .arg("-S")
+            .arg("id")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("无法启动提权验证进程: {e}"))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(format!("{password}\n").as_bytes()).await;
+        }
+
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| format!("提权进程执行错误: {e}"))?;
+
+        if output.status.success() {
+            let mut inner = state.inner.lock().await;
+            inner.sudo_password = Some(password);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 }
 
 /// 返回当前 App 会话是否已经保存过经验证的 sudo 密码。
 #[tauri::command]
 pub async fn has_sudo_credentials(state: State<'_, VpnManager>) -> Result<bool, String> {
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(windows::helper_is_available(state.inner()).await);
+    }
     Ok(state.inner.lock().await.sudo_password.is_some())
 }
 
 #[tauri::command]
 pub async fn get_vpn_state(
+    _app_handle: AppHandle,
     state: State<'_, VpnManager>,
     vpn_type: VpnType,
 ) -> Result<VpnStatePayload, String> {
+    #[cfg(target_os = "windows")]
+    windows::refresh(&_app_handle, state.inner()).await?;
+
     let inner = state.inner.lock().await;
     let (status, ip, start_time) = match vpn_type {
         VpnType::Fortinet => (
@@ -651,18 +703,32 @@ pub struct VpnAuthPayload {
 
 #[tauri::command]
 pub async fn submit_vpn_mfa(state: State<'_, VpnManager>, code: String) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt;
-    let mut inner = state.inner.lock().await;
-    if let Some(mut stdin) = inner.atrust_stdin.take() {
-        stdin
-            .write_all(format!("{code}\n").as_bytes())
-            .await
-            .map_err(|e| format!("写入二次验证码失败: {e}"))?;
-        // 写完后将其保留，以防万一后续还需要 stdin
-        inner.atrust_stdin = Some(stdin);
-        Ok(())
-    } else {
-        Err("当前未处于等待二次认证验证码的状态".to_string())
+    #[cfg(target_os = "windows")]
+    {
+        return windows::submit_mfa(state.inner(), code).await;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (state, code);
+        return Err("当前操作系统不支持 VPN 二次认证".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut inner = state.inner.lock().await;
+        if let Some(mut stdin) = inner.atrust_stdin.take() {
+            stdin
+                .write_all(format!("{code}\n").as_bytes())
+                .await
+                .map_err(|e| format!("写入二次验证码失败: {e}"))?;
+            // 写完后将其保留，以防万一后续还需要 stdin
+            inner.atrust_stdin = Some(stdin);
+            Ok(())
+        } else {
+            Err("当前未处于等待二次认证验证码的状态".to_string())
+        }
     }
 }
 

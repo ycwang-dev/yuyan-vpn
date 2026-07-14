@@ -9,6 +9,12 @@ use tauri::{Emitter, Manager};
 mod app_update;
 mod vpn;
 
+/** Windows 主程序在创建 WebView 前尝试进入无界面的 UAC helper 模式。 */
+#[cfg(target_os = "windows")]
+pub fn run_windows_vpn_helper_if_requested() -> bool {
+    vpn::windows::run_helper_if_requested()
+}
+
 /** 暗色主题下的 App Dock 图标字节（已更新为全新的 C4D 液态玻璃图标且优化尺寸边距） */
 const DARK_ICON: &[u8] = include_bytes!("../resources/yuyan_dark_clean.png");
 /** 亮色主题下的 App Dock 图标字节（已更新为全新的 C4D 液态玻璃图标且优化尺寸边距） */

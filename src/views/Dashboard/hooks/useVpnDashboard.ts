@@ -3,10 +3,12 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { message } from 'ant-design-vue';
 import { useVpnLogs } from '@/hooks/useVpnLogs';
+import { detectPlatform } from '@/utils/platformDetect';
 import { type VpnStats, VPN_TYPES } from '../constant';
 
 export function useVpnDashboard() {
   const { appendLog, initLogListener } = useVpnLogs();
+  const isWindows = detectPlatform().platform === 'windows';
 
   // 两个 VPN 的状态
   const fortinetState = ref<VpnStats>({
@@ -76,20 +78,23 @@ export function useVpnDashboard() {
     }
   };
 
-  // 验证 Sudo 提权密码并暂存
+  /** 验证 macOS sudo，或在 Windows 上请求不传密码的 UAC helper 授权。 */
   const submitSudoPassword = async () => {
-    if (!sudoPasswordInput.value) {
+    if (!isWindows && !sudoPasswordInput.value) {
       message.warning('Sudo 密码不能为空');
       return;
     }
     sudoVerifying.value = true;
     try {
+      if (isWindows) {
+        message.info('请在 Windows 用户账户控制窗口中确认管理员授权');
+      }
       const success: boolean = await invoke('verify_sudo_password', {
-        password: sudoPasswordInput.value,
+        password: isWindows ? '' : sudoPasswordInput.value,
       });
       if (success) {
         sudoVisible.value = false;
-        message.success('macOS 提权验证成功');
+        message.success(isWindows ? 'Windows VPN 管理 helper 已授权' : 'macOS 提权验证成功');
         
         // 提权成功后，继续触发此前被拦截的连接请求
         const target = vpnToConnectAfterSudo.value;
@@ -104,13 +109,26 @@ export function useVpnDashboard() {
           void doDisconnectAll();
         }
       } else {
-        message.error('Sudo 密码错误，提权失败');
+        message.error(isWindows ? 'Windows 管理员授权未完成' : 'Sudo 密码错误，提权失败');
       }
     } catch (err: any) {
-      message.error(err?.toString() || '密码提权发生未知错误');
+      message.error(err?.toString() || (isWindows ? 'Windows 管理员授权失败' : '密码提权发生未知错误'));
     } finally {
       sudoVerifying.value = false;
     }
+  };
+
+  /** 根据平台触发 macOS 密码框或 Windows 原生 UAC。 */
+  const requestSystemAuthorization = async (
+    target: 'fortinet' | 'atrust' | 'both' | 'disconnectAll',
+  ) => {
+    vpnToConnectAfterSudo.value = target;
+    sudoPasswordInput.value = '';
+    if (isWindows) {
+      await submitSudoPassword();
+      return;
+    }
+    sudoVisible.value = true;
   };
 
   // 执行 Fortinet 连接
@@ -190,9 +208,7 @@ export function useVpnDashboard() {
       // 检查后端是否已有 sudo 密码
       const hasSudo = await checkSudoAvailability();
       if (!hasSudo) {
-        vpnToConnectAfterSudo.value = 'fortinet';
-        sudoPasswordInput.value = '';
-        sudoVisible.value = true;
+        await requestSystemAuthorization('fortinet');
       } else {
         void doConnectFortinet();
       }
@@ -224,9 +240,7 @@ export function useVpnDashboard() {
     } else {
       const hasSudo = await checkSudoAvailability();
       if (!hasSudo) {
-        vpnToConnectAfterSudo.value = 'atrust';
-        sudoPasswordInput.value = '';
-        sudoVisible.value = true;
+        await requestSystemAuthorization('atrust');
       } else {
         void doConnectAtrust();
       }
@@ -254,9 +268,7 @@ export function useVpnDashboard() {
 
     const hasSudo = await checkSudoAvailability();
     if (!hasSudo) {
-      vpnToConnectAfterSudo.value = 'both';
-      sudoPasswordInput.value = '';
-      sudoVisible.value = true;
+      await requestSystemAuthorization('both');
     } else {
       void doConnectBoth();
     }
@@ -320,9 +332,7 @@ export function useVpnDashboard() {
   const disconnectAll = async () => {
     const hasSudo = await checkSudoAvailability();
     if (!hasSudo) {
-      vpnToConnectAfterSudo.value = 'disconnectAll';
-      sudoPasswordInput.value = '';
-      sudoVisible.value = true;
+      await requestSystemAuthorization('disconnectAll');
       return;
     }
     await doDisconnectAll();
@@ -415,6 +425,7 @@ export function useVpnDashboard() {
     fortinetState,
     atrustState,
     sudoVisible,
+    isWindows,
     sudoPasswordInput,
     sudoVerifying,
     submitSudoPassword,

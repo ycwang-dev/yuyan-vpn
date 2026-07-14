@@ -15,6 +15,7 @@ const {
   fortinetState,
   atrustState,
   sudoVisible,
+  isWindows,
   sudoPasswordInput,
   sudoVerifying,
   submitSudoPassword,
@@ -179,8 +180,9 @@ const isAnyConnecting = computed(() => {
       </div>
     </div>
 
-    <!-- macOS 提权输入对话框 -->
+    <!-- macOS 提权输入对话框；Windows 直接使用系统 UAC，不收集登录密码。 -->
     <a-modal
+      v-if="!isWindows"
       v-model:open="sudoVisible"
       title="macOS 系统权限验证"
       :confirm-loading="sudoVerifying"
