@@ -22,20 +22,84 @@ pub async fn maintain_idle_network_state(manager: VpnManager) {
     }
 }
 
-/** 北京 Fortinet VPN 固定网关。 */
-pub const FORTINET_HOST: &str = "fortinet.example.com";
-/** 北京 Fortinet VPN 固定端口。 */
-pub const FORTINET_PORT: u16 = 443;
-/** 北京 Fortinet VPN 固定账号。 */
-pub const FORTINET_USERNAME: &str = "sslvpn";
-/** 北京 Fortinet VPN 固定内网路由。 */
-pub const FORTINET_ROUTES: &[&str] = &["192.168.1.0/24"];
-/** 长沙 aTrust VPN 固定网关。 */
-pub const ATRUST_HOST: &str = "atrust.example.com";
-/** 长沙 aTrust VPN 固定端口。 */
-pub const ATRUST_PORT: u16 = 443;
-/** 长沙 aTrust VPN 固定账号。 */
-pub const ATRUST_USERNAME: &str = "atrustvpn";
+/** 公开源码使用的 Fortinet 占位网关，正式安装包禁止连接该地址。 */
+const FORTINET_PLACEHOLDER_HOST: &str = "fortinet.example.com";
+/** 公开源码使用的 Fortinet 占位账号。 */
+const FORTINET_PLACEHOLDER_USERNAME: &str = "sslvpn";
+/** 公开源码使用的 aTrust 占位网关，正式安装包禁止连接该地址。 */
+const ATRUST_PLACEHOLDER_HOST: &str = "atrust.example.com";
+/** 公开源码使用的 aTrust 占位账号。 */
+const ATRUST_PLACEHOLDER_USERNAME: &str = "atrustvpn";
+/** 未注入构建参数时用于开源演示的端口。 */
+const PLACEHOLDER_PORT: u16 = 443;
+
+/** 返回构建时注入的字符串，空值时使用公开占位值。 */
+fn packaged_value(value: Option<&'static str>, placeholder: &'static str) -> &'static str {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(placeholder)
+}
+
+/** 读取构建时注入的端口，非法值回退到公开占位端口。 */
+fn packaged_port(value: Option<&'static str>) -> u16 {
+    value
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(PLACEHOLDER_PORT)
+}
+
+/** 返回安装包内置的 Fortinet 默认网关。 */
+fn packaged_fortinet_host() -> &'static str {
+    packaged_value(
+        option_env!("VITE_DEFAULT_FORTINET_HOST"),
+        FORTINET_PLACEHOLDER_HOST,
+    )
+}
+
+/** 返回安装包内置的 Fortinet 默认端口。 */
+fn packaged_fortinet_port() -> u16 {
+    packaged_port(option_env!("VITE_DEFAULT_FORTINET_PORT"))
+}
+
+/** 返回安装包内置的 Fortinet 默认账号。 */
+fn packaged_fortinet_username() -> &'static str {
+    packaged_value(
+        option_env!("VITE_DEFAULT_FORTINET_USERNAME"),
+        FORTINET_PLACEHOLDER_USERNAME,
+    )
+}
+
+/** 返回安装包内置的 aTrust 默认网关。 */
+fn packaged_atrust_host() -> &'static str {
+    packaged_value(
+        option_env!("VITE_DEFAULT_ATRUST_HOST"),
+        ATRUST_PLACEHOLDER_HOST,
+    )
+}
+
+/** 返回安装包内置的 aTrust 默认端口。 */
+fn packaged_atrust_port() -> u16 {
+    packaged_port(option_env!("VITE_DEFAULT_ATRUST_PORT"))
+}
+
+/** 返回安装包内置的 aTrust 默认账号。 */
+fn packaged_atrust_username() -> &'static str {
+    packaged_value(
+        option_env!("VITE_DEFAULT_ATRUST_USERNAME"),
+        ATRUST_PLACEHOLDER_USERNAME,
+    )
+}
+
+/** 返回安装包内置的北京内网路由列表。 */
+fn packaged_fortinet_routes() -> Vec<String> {
+    option_env!("VITE_DEFAULT_FORTINET_ROUTES")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|route| !route.is_empty())
+        .map(str::to_string)
+        .collect()
+}
 
 /**
  * 解析当前构建模式下的 macOS sidecar 路径。
@@ -339,10 +403,8 @@ fn normalize_ipv4_cidr(route: &str) -> Result<String, String> {
 /** 合并内置路由与用户附加路由，并保持顺序去重。 */
 fn normalize_fortinet_routes(routes: &[String]) -> Result<Vec<String>, String> {
     let mut normalized_routes = Vec::new();
-    for route in FORTINET_ROUTES
-        .iter()
-        .copied()
-        .map(str::to_string)
+    for route in packaged_fortinet_routes()
+        .into_iter()
         .chain(routes.iter().cloned())
     {
         let normalized_route = normalize_ipv4_cidr(&route)?;
@@ -353,11 +415,99 @@ fn normalize_fortinet_routes(routes: &[String]) -> Result<Vec<String>, String> {
     Ok(normalized_routes)
 }
 
-/** 将可持久化设置规范为安装包内置的服务器参数，并保留有效的附加路由。 */
+/** 判断配置是否仍指向公开源码占位网关。 */
+fn is_placeholder_host(host: &str) -> bool {
+    let host = host.trim();
+    host.eq_ignore_ascii_case(FORTINET_PLACEHOLDER_HOST)
+        || host.eq_ignore_ascii_case(ATRUST_PLACEHOLDER_HOST)
+}
+
+/** 使用安装包参数迁移空值或公开占位值，同时保留用户已有的真实配置。 */
+fn migrate_packaged_endpoint(
+    config: &mut VpnConfig,
+    placeholder_host: &str,
+    placeholder_username: &str,
+    packaged_host: &str,
+    packaged_port: u16,
+    packaged_username: &str,
+) {
+    let should_replace_host =
+        config.host.trim().is_empty() || config.host.trim().eq_ignore_ascii_case(placeholder_host);
+    if should_replace_host {
+        config.host = packaged_host.to_string();
+        config.port = packaged_port;
+    } else {
+        config.host = config.host.trim().to_string();
+        if config.port == 0 {
+            config.port = packaged_port;
+        }
+    }
+
+    if config.username.trim().is_empty()
+        || config
+            .username
+            .trim()
+            .eq_ignore_ascii_case(placeholder_username)
+    {
+        config.username = packaged_username.to_string();
+    } else {
+        config.username = config.username.trim().to_string();
+    }
+}
+
+/** 连接前校验网关与账号，禁止正式流程误用公开占位参数或注入配置行。 */
+fn validate_vpn_connection_config(label: &str, config: &VpnConfig) -> Result<(), String> {
+    let host = config.host.trim();
+    if host.is_empty() {
+        return Err(format!("{label} VPN 网关不能为空"));
+    }
+    if is_placeholder_host(host) {
+        return Err(format!(
+            "{label} VPN 安装包未注入正式服务器配置，请检查构建参数后重新安装"
+        ));
+    }
+    if host.chars().any(char::is_whitespace)
+        || host.contains('/')
+        || host.contains('=')
+        || host.contains(':') && host.parse::<std::net::Ipv6Addr>().is_err()
+    {
+        return Err(format!("{label} VPN 网关格式无效"));
+    }
+    if config.port == 0 {
+        return Err(format!("{label} VPN 端口无效"));
+    }
+    if config.username.trim().is_empty()
+        || config
+            .username
+            .chars()
+            .any(|char| matches!(char, '\r' | '\n' | '='))
+    {
+        return Err(format!("{label} VPN 账号格式无效"));
+    }
+    Ok(())
+}
+
+/** 将可持久化设置迁移到安装包参数，并保留已有真实服务器与有效附加路由。 */
 fn normalize_settings(mut settings: AppVpnSettings) -> Result<AppVpnSettings, String> {
+    migrate_packaged_endpoint(
+        &mut settings.fortinet,
+        FORTINET_PLACEHOLDER_HOST,
+        FORTINET_PLACEHOLDER_USERNAME,
+        packaged_fortinet_host(),
+        packaged_fortinet_port(),
+        packaged_fortinet_username(),
+    );
     settings.fortinet.enabled = true;
     settings.fortinet.custom_routes = normalize_fortinet_routes(&settings.fortinet.custom_routes)?;
 
+    migrate_packaged_endpoint(
+        &mut settings.atrust,
+        ATRUST_PLACEHOLDER_HOST,
+        ATRUST_PLACEHOLDER_USERNAME,
+        packaged_atrust_host(),
+        packaged_atrust_port(),
+        packaged_atrust_username(),
+    );
     settings.atrust.enabled = true;
     settings.atrust.custom_routes.clear();
     Ok(settings)
@@ -368,21 +518,18 @@ fn default_settings() -> AppVpnSettings {
     AppVpnSettings {
         fortinet: VpnConfig {
             enabled: true,
-            host: FORTINET_HOST.to_string(),
-            port: FORTINET_PORT,
-            username: FORTINET_USERNAME.to_string(),
+            host: packaged_fortinet_host().to_string(),
+            port: packaged_fortinet_port(),
+            username: packaged_fortinet_username().to_string(),
             password: None,
             save_password: false,
-            custom_routes: FORTINET_ROUTES
-                .iter()
-                .map(|route| (*route).to_string())
-                .collect(),
+            custom_routes: packaged_fortinet_routes(),
         },
         atrust: VpnConfig {
             enabled: true,
-            host: ATRUST_HOST.to_string(),
-            port: ATRUST_PORT,
-            username: ATRUST_USERNAME.to_string(),
+            host: packaged_atrust_host().to_string(),
+            port: packaged_atrust_port(),
+            username: packaged_atrust_username().to_string(),
             password: None,
             save_password: false,
             custom_routes: Vec::new(),
@@ -528,7 +675,10 @@ pub struct VpnCaptchaPayload {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_fortinet_routes, normalize_ipv4_cidr};
+    use super::{
+        migrate_packaged_endpoint, normalize_fortinet_routes, normalize_ipv4_cidr,
+        validate_vpn_connection_config, VpnConfig,
+    };
 
     /** 验证带主机位的输入会归一为网络地址。 */
     #[test]
@@ -546,18 +696,24 @@ mod tests {
     /** 验证默认路由始终存在，附加路由会规范化并去重。 */
     #[test]
     fn merges_built_in_and_additional_fortinet_routes() {
+        let built_in_routes = super::packaged_fortinet_routes();
         let routes = vec![
             "192.168.111.64/24".to_string(),
             "192.168.100.0/24".to_string(),
         ];
+        let normalized = normalize_fortinet_routes(&routes).expect("路由应可规范化");
 
+        for route in built_in_routes {
+            let route = normalize_ipv4_cidr(&route).expect("内置路由应有效");
+            assert!(normalized.contains(&route));
+        }
+        assert!(normalized.contains(&"192.168.111.0/24".to_string()));
         assert_eq!(
-            normalize_fortinet_routes(&routes),
-            Ok(vec![
-                "192.168.100.0/24".to_string(),
-                "192.168.111.64/32".to_string(),
-                "192.168.111.0/24".to_string(),
-            ])
+            normalized.len(),
+            normalized
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
         );
     }
 
@@ -566,5 +722,101 @@ mod tests {
     fn rejects_unsafe_or_invalid_fortinet_routes() {
         assert!(normalize_ipv4_cidr("0.0.0.0/0").is_err());
         assert!(normalize_ipv4_cidr("192.168.111.0").is_err());
+    }
+
+    /** 验证公开占位网关不会再启动真实 VPN 子进程。 */
+    #[test]
+    fn rejects_public_placeholder_vpn_host() {
+        let config = VpnConfig {
+            enabled: true,
+            host: "fortinet.example.com".to_string(),
+            port: 443,
+            username: "sslvpn".to_string(),
+            password: None,
+            save_password: false,
+            custom_routes: Vec::new(),
+        };
+
+        assert!(validate_vpn_connection_config("Fortinet", &config).is_err());
+    }
+
+    /** 验证旧占位配置会迁移到安装包注入值，而已有真实配置保持不变。 */
+    #[test]
+    fn migrates_placeholder_endpoint_without_overwriting_real_host() {
+        let mut placeholder = VpnConfig {
+            enabled: true,
+            host: "fortinet.example.com".to_string(),
+            port: 443,
+            username: "sslvpn".to_string(),
+            password: Some("secret".to_string()),
+            save_password: true,
+            custom_routes: Vec::new(),
+        };
+        migrate_packaged_endpoint(
+            &mut placeholder,
+            "fortinet.example.com",
+            "sslvpn",
+            "vpn.corp.invalid",
+            10443,
+            "shared-user",
+        );
+        assert_eq!(placeholder.host, "vpn.corp.invalid");
+        assert_eq!(placeholder.port, 10443);
+        assert_eq!(placeholder.username, "shared-user");
+        assert_eq!(placeholder.password.as_deref(), Some("secret"));
+
+        let mut real = placeholder.clone();
+        real.host = "vpn.custom.invalid".to_string();
+        migrate_packaged_endpoint(
+            &mut real,
+            "fortinet.example.com",
+            "sslvpn",
+            "vpn.corp.invalid",
+            10443,
+            "shared-user",
+        );
+        assert_eq!(real.host, "vpn.custom.invalid");
+    }
+
+    /** 验证本机或 CI 提供构建参数时，Rust 后端确实使用同一份注入值。 */
+    #[test]
+    fn uses_injected_vpn_build_configuration() {
+        if let Some(expected_host) = option_env!("VITE_DEFAULT_FORTINET_HOST") {
+            assert_eq!(super::packaged_fortinet_host(), expected_host);
+            assert!(!super::is_placeholder_host(expected_host));
+        }
+        if let Some(expected_port) = option_env!("VITE_DEFAULT_FORTINET_PORT") {
+            assert_eq!(
+                super::packaged_fortinet_port(),
+                expected_port.parse::<u16>().unwrap()
+            );
+        }
+        if let Some(expected_username) = option_env!("VITE_DEFAULT_FORTINET_USERNAME") {
+            assert_eq!(super::packaged_fortinet_username(), expected_username);
+        }
+        if let Some(expected_routes) = option_env!("VITE_DEFAULT_FORTINET_ROUTES") {
+            assert_eq!(
+                super::packaged_fortinet_routes(),
+                expected_routes
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|route| !route.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            );
+        }
+        if let Some(expected_host) = option_env!("VITE_DEFAULT_ATRUST_HOST") {
+            assert_eq!(super::packaged_atrust_host(), expected_host);
+            assert!(!super::is_placeholder_host(expected_host));
+        }
+        if let Some(expected_port) = option_env!("VITE_DEFAULT_ATRUST_PORT") {
+            assert_eq!(
+                super::packaged_atrust_port(),
+                expected_port.parse::<u16>().unwrap()
+            );
+        }
+        if let Some(expected_username) = option_env!("VITE_DEFAULT_ATRUST_USERNAME") {
+            assert_eq!(super::packaged_atrust_username(), expected_username);
+        }
     }
 }

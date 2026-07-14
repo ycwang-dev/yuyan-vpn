@@ -1,8 +1,8 @@
 const envRoutes = import.meta.env.VITE_DEFAULT_FORTINET_ROUTES;
-/** Fortinet 默认内网路由，始终随应用启用且不可删除。 */
+/** Fortinet 默认内网路由，仅由正式构建参数注入并始终随应用启用。 */
 export const BUILT_IN_FORTINET_ROUTES = envRoutes
   ? (envRoutes.split(',').map((r: string) => r.trim()) as string[])
-  : ['192.168.1.0/24'];
+  : [];
 
 /** VPN 设置表单模型。 */
 export interface VpnSettingsForm {

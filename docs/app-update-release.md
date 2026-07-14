@@ -14,9 +14,12 @@
    - `TAURI_SIGNING_PRIVATE_KEY`：本机 `~/.tauri/yuyan-vpn-updater.key` 的完整内容。
    - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：当前密钥为空密码，可不创建或保持为空。
    - `PERSONAL_ACCESS_TOKEN`：仅在安装 `@ycwang-dev/*` 私有 npm 包时使用，需要 `read:packages` 权限，不参与 Release 发布。
+   - `VITE_DEFAULT_FORTINET_HOST`、`VITE_DEFAULT_FORTINET_PORT`、`VITE_DEFAULT_FORTINET_USERNAME`：正式 Fortinet 网关、端口和共享账号。
+   - `VITE_DEFAULT_FORTINET_ROUTES`：逗号分隔的北京内网 CIDR 列表。
+   - `VITE_DEFAULT_ATRUST_HOST`、`VITE_DEFAULT_ATRUST_PORT`、`VITE_DEFAULT_ATRUST_USERNAME`：正式 aTrust 网关、端口和共享账号。
 3. 将 `~/.tauri/yuyan-vpn-updater.key` 离线备份到受控密码库。该私钥丢失后，已安装旧版本将无法验证新密钥签出的更新。
 
-本地 `.env.local` 已被 `*.local` 忽略规则排除，不应提交。GitHub Actions 无法读取开发机上的该文件；CI 构建所需的签名私钥和包读取令牌必须配置为 Actions secrets。
+本地 `.env.local` 已被 `*.local` 忽略规则排除，不应提交。本机 Tauri 构建会读取其中同名的 `VITE_DEFAULT_*` 参数；GitHub Actions 无法读取开发机文件，正式 CI 必须配置上述 Actions secrets。缺失参数或网关仍为 `example.com` 时，workflow 会在打包前终止，避免发布无效安装包。
 
 ## 发布产物
 

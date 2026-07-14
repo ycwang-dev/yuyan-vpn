@@ -44,6 +44,43 @@ jobs:
             exit 1
           fi
 
+      - name: Validate private VPN build configuration
+        shell: bash
+        env:
+          VITE_DEFAULT_FORTINET_HOST: ${{ secrets.VITE_DEFAULT_FORTINET_HOST }}
+          VITE_DEFAULT_FORTINET_PORT: ${{ secrets.VITE_DEFAULT_FORTINET_PORT }}
+          VITE_DEFAULT_FORTINET_USERNAME: ${{ secrets.VITE_DEFAULT_FORTINET_USERNAME }}
+          VITE_DEFAULT_FORTINET_ROUTES: ${{ secrets.VITE_DEFAULT_FORTINET_ROUTES }}
+          VITE_DEFAULT_ATRUST_HOST: ${{ secrets.VITE_DEFAULT_ATRUST_HOST }}
+          VITE_DEFAULT_ATRUST_PORT: ${{ secrets.VITE_DEFAULT_ATRUST_PORT }}
+          VITE_DEFAULT_ATRUST_USERNAME: ${{ secrets.VITE_DEFAULT_ATRUST_USERNAME }}
+        run: |
+          required=(
+            VITE_DEFAULT_FORTINET_HOST
+            VITE_DEFAULT_FORTINET_PORT
+            VITE_DEFAULT_FORTINET_USERNAME
+            VITE_DEFAULT_FORTINET_ROUTES
+            VITE_DEFAULT_ATRUST_HOST
+            VITE_DEFAULT_ATRUST_PORT
+            VITE_DEFAULT_ATRUST_USERNAME
+          )
+          for name in "${required[@]}"; do
+            if [ -z "${!name}" ]; then
+              echo "Missing repository secret: $name" >&2
+              exit 1
+            fi
+          done
+          case "$VITE_DEFAULT_FORTINET_HOST $VITE_DEFAULT_ATRUST_HOST" in
+            *example.com*)
+              echo 'VPN build configuration still contains public placeholder hosts' >&2
+              exit 1
+              ;;
+          esac
+          [[ "$VITE_DEFAULT_FORTINET_PORT" =~ ^[0-9]+$ ]] || exit 1
+          [[ "$VITE_DEFAULT_ATRUST_PORT" =~ ^[0-9]+$ ]] || exit 1
+          (( VITE_DEFAULT_FORTINET_PORT >= 1 && VITE_DEFAULT_FORTINET_PORT <= 65535 )) || exit 1
+          (( VITE_DEFAULT_ATRUST_PORT >= 1 && VITE_DEFAULT_ATRUST_PORT <= 65535 )) || exit 1
+
       - name: Calculate Version
         id: calc
         run: node scripts/bump-version.js
@@ -207,6 +244,13 @@ jobs:
           NODE_OPTIONS: '--max-old-space-size=4096'
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          VITE_DEFAULT_FORTINET_HOST: ${{ secrets.VITE_DEFAULT_FORTINET_HOST }}
+          VITE_DEFAULT_FORTINET_PORT: ${{ secrets.VITE_DEFAULT_FORTINET_PORT }}
+          VITE_DEFAULT_FORTINET_USERNAME: ${{ secrets.VITE_DEFAULT_FORTINET_USERNAME }}
+          VITE_DEFAULT_FORTINET_ROUTES: ${{ secrets.VITE_DEFAULT_FORTINET_ROUTES }}
+          VITE_DEFAULT_ATRUST_HOST: ${{ secrets.VITE_DEFAULT_ATRUST_HOST }}
+          VITE_DEFAULT_ATRUST_PORT: ${{ secrets.VITE_DEFAULT_ATRUST_PORT }}
+          VITE_DEFAULT_ATRUST_USERNAME: ${{ secrets.VITE_DEFAULT_ATRUST_USERNAME }}
 
       - name: Verify macOS Bundle Architecture
         if: runner.os == 'macOS'

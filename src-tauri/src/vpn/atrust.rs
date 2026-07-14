@@ -1,6 +1,6 @@
 use super::{
-    emit_vpn_log, resolve_macos_sidecar, VpnCaptchaPayload, VpnManager, VpnManagerInner,
-    VpnStatePayload, VpnStatus, VpnType, ATRUST_HOST, ATRUST_PORT, ATRUST_USERNAME,
+    emit_vpn_log, load_vpn_config, resolve_macos_sidecar, validate_vpn_connection_config,
+    VpnCaptchaPayload, VpnManager, VpnManagerInner, VpnStatePayload, VpnStatus, VpnType,
 };
 use std::process::Stdio;
 use std::sync::Arc;
@@ -325,6 +325,11 @@ pub async fn connect_atrust(
     }
     state.inner().ensure_connections_allowed()?;
     let zju_connect_bin = resolve_macos_sidecar("zju-connect")?;
+    let atrust_config = load_vpn_config(app_handle.clone()).await?.atrust;
+    validate_vpn_connection_config("aTrust", &atrust_config)?;
+    let host = atrust_config.host;
+    let port = atrust_config.port;
+    let username = atrust_config.username;
     let sudo_pass = {
         let mut inner = state.inner.lock().await;
         if inner.atrust_status == VpnStatus::Connecting
@@ -426,9 +431,9 @@ auth_type = "auth/psw"
 login_domain = "local"
 client_data_file = ""
 "#,
-        ATRUST_HOST,
-        ATRUST_PORT,
-        ATRUST_USERNAME,
+        host,
+        port,
+        username,
         toml_escape(&password),
         cfg!(debug_assertions)
     );
