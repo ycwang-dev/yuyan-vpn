@@ -174,10 +174,12 @@ jobs:
           cp "$SOURCE_DIR/LICENSE" "$OUTPUT_DIR/LICENSE-OPENFORTIVPN.txt"
           cp "$SOURCE_DIR/LICENSE.OpenSSL" "$OUTPUT_DIR/LICENSE-OPENSSL.txt"
 
-          "$OUTPUT_DIR/openfortivpn.exe" --version
+          OPENFORTIVPN_VERSION="$("$OUTPUT_DIR/openfortivpn.exe" --version)"
+          test "$OPENFORTIVPN_VERSION" = '1.24.1'
+          JSON_EVENTS_VERSION="$("$OUTPUT_DIR/openfortivpn.exe" --json-events --version)"
+          test "$JSON_EVENTS_VERSION" = '1.24.1'
           STRINGS_PATH="$(cygpath -u "$RUNNER_TEMP")/openfortivpn-windows-strings.txt"
           strings "$OUTPUT_DIR/openfortivpn.exe" > "$STRINGS_PATH"
-          grep -q -- '--json-events' "$STRINGS_PATH"
           grep -q 'Wintun adapter destroyed' "$STRINGS_PATH"
           ldd "$OUTPUT_DIR/openfortivpn.exe" | tee "$OUTPUT_DIR/openfortivpn-runtime-dependencies.txt"
           if grep -q 'not found' "$OUTPUT_DIR/openfortivpn-runtime-dependencies.txt"; then
