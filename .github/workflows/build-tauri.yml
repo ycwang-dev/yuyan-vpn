@@ -3,6 +3,7 @@ name: Build Tauri App
 on:
   push:
     branches:
+      - codex/windows-vpn-productization
       - feat/github-actions-build
       - main
       - yuyan-vpn
@@ -103,6 +104,19 @@ jobs:
           go-version: '1.25.6'
           cache: false
 
+      - name: Setup MSYS2 for pinned openfortivpn candidate
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            patch
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-ninja
+
       - name: Build pinned zju-connect candidate with Wintun
         shell: pwsh
         run: |
@@ -132,13 +146,58 @@ jobs:
           Copy-Item (Join-Path $WintunDir 'wintun\bin\amd64\wintun.dll') $OutputDir
           Copy-Item (Join-Path $WintunDir 'wintun\LICENSE.txt') (Join-Path $OutputDir 'LICENSE-WINTUN.txt')
           Copy-Item (Join-Path $SourceDir 'LICENSE') (Join-Path $OutputDir 'LICENSE-ZJU-CONNECT.txt')
+          & (Join-Path $OutputDir 'zju-connect.exe') -version
+
+      - name: Build patched pinned openfortivpn Windows candidate
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          SOURCE_DIR="$(cygpath -u "$RUNNER_TEMP")/openfortivpn-windows-source"
+          OUTPUT_DIR="$(cygpath -u "$GITHUB_WORKSPACE")/windows-engine-candidate"
+          PATCH_PATH="$(cygpath -u "$GITHUB_WORKSPACE")/scripts/patches/openfortivpn-windows-cleanup.patch"
+          COMMIT='409de945242328d7bea6e225dcfb2f45b7fe70e5'
+
+          git clone --filter=blob:none --no-checkout https://github.com/hkirste/openfortivpn.git "$SOURCE_DIR"
+          git -C "$SOURCE_DIR" checkout --detach "$COMMIT"
+          test "$(git -C "$SOURCE_DIR" rev-parse HEAD)" = "$COMMIT"
+          git -C "$SOURCE_DIR" apply --check "$PATCH_PATH"
+          git -C "$SOURCE_DIR" apply "$PATCH_PATH"
+
+          cmake -S "$SOURCE_DIR" -B "$SOURCE_DIR/build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=ON
+          cmake --build "$SOURCE_DIR/build"
+          ctest --test-dir "$SOURCE_DIR/build" --output-on-failure
+
+          cp "$SOURCE_DIR/build/openfortivpn.exe" "$OUTPUT_DIR/openfortivpn.exe"
+          cp "$SOURCE_DIR/LICENSE" "$OUTPUT_DIR/LICENSE-OPENFORTIVPN.txt"
+          cp "$SOURCE_DIR/LICENSE.OpenSSL" "$OUTPUT_DIR/LICENSE-OPENSSL.txt"
+
+          "$OUTPUT_DIR/openfortivpn.exe" --version
+          strings "$OUTPUT_DIR/openfortivpn.exe" | grep -q -- '--json-events'
+          strings "$OUTPUT_DIR/openfortivpn.exe" | grep -q 'Wintun adapter destroyed'
+          ldd "$OUTPUT_DIR/openfortivpn.exe" | tee "$OUTPUT_DIR/openfortivpn-runtime-dependencies.txt"
+          if grep -q 'not found' "$OUTPUT_DIR/openfortivpn-runtime-dependencies.txt"; then
+            echo 'openfortivpn Windows 候选仍有缺失的运行库' >&2
+            exit 1
+          fi
+          awk '/=> \/mingw64\/bin\// { print $3 }' "$OUTPUT_DIR/openfortivpn-runtime-dependencies.txt" \
+            | while IFS= read -r runtime_dll; do
+                cp "$runtime_dll" "$OUTPUT_DIR/"
+              done
+
+      - name: Record Windows engine candidate boundary
+        shell: pwsh
+        run: |
+          $OutputDir = Join-Path $env:GITHUB_WORKSPACE 'windows-engine-candidate'
           @(
             '候选资产，不得直接进入正式安装包。',
             'zju-connect v1.2.0 commit: 5978df461662042cb4704488980632b23a2003c5',
-            'source: https://github.com/Mythologyli/zju-connect',
-            '在 Windows 10/11 完成公司 aTrust 真机验收且恢复定制补丁源码后方可集成。'
+            'openfortivpn Windows PR candidate commit: 409de945242328d7bea6e225dcfb2f45b7fe70e5',
+            'openfortivpn cleanup patch: scripts/patches/openfortivpn-windows-cleanup.patch',
+            'Wintun 0.14.1 official signed amd64 DLL.',
+            '只有 Rust helper、进程/路由/退出清理与 Windows 10/11 真机门禁全部通过后才允许进入安装包。'
           ) | Set-Content -Encoding UTF8 (Join-Path $OutputDir 'CANDIDATE-NOTICE.txt')
-          & (Join-Path $OutputDir 'zju-connect.exe') -version
 
       - name: Upload Windows engine candidate
         uses: actions/upload-artifact@v7
@@ -301,6 +360,7 @@ jobs:
 
   release:
     needs: [prep-version, build, windows-engine-feasibility]
+    if: github.ref == 'refs/heads/main' || github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
