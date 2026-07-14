@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "externalBin": [
+      "binaries/openfortivpn",
+      "binaries/zju-connect"
+    ]
+  }
+}

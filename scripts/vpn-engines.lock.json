@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "macos": {
+    "openfortivpnArm64": {
+      "version": "1.18.0",
+      "sha256": "34b86b94cba093fbbfa829109ade986c072117f55d45d6d742695e7d0d89b019",
+      "policy": "frozen"
+    },
+    "openfortivpnX64": {
+      "version": "1.24.1",
+      "source": "https://github.com/adrienverge/openfortivpn.git",
+      "commit": "a40a2d588733d48534eb78cd17b90142e5ba039b",
+      "license": "GPL-3.0-or-later",
+      "patches": [
+        "scripts/patches/openfortivpn-1.24.1-http-status.patch"
+      ],
+      "staticTls": {
+        "name": "OpenSSL",
+        "version": "3.6.2",
+        "source": "https://github.com/openssl/openssl/releases/download/openssl-3.6.2/openssl-3.6.2.tar.gz",
+        "archiveSha256": "aaf51a1fe064384f811daeaeb4ec4dce7340ec8bd893027eee676af31e83a04f",
+        "macosDeploymentTarget": "12.0"
+      },
+      "policy": "ci-build-and-intel-real-device-validation"
+    },
+    "zjuConnectExisting": {
+      "version": "unknown-custom-build",
+      "arm64Sha256": "a8c9825a33d96e77537783dbd80151b8795202b3e1bb2d4b5b3078d8f958b1c0",
+      "x64Sha256": "431c90d0638c7198602345f7ff1b68ef11f1a9acda4d3ce513e6e23e47794b47",
+      "license": "AGPL-3.0",
+      "policy": "source-recovery-required"
+    }
+  },
+  "windows": {
+    "zjuConnectCandidate": {
+      "version": "1.2.0",
+      "source": "https://github.com/Mythologyli/zju-connect.git",
+      "commit": "5978df461662042cb4704488980632b23a2003c5",
+      "license": "AGPL-3.0",
+      "policy": "candidate-only-not-packaged"
+    },
+    "wintun": {
+      "version": "0.14.1",
+      "source": "https://www.wintun.net/builds/wintun-0.14.1.zip",
+      "archiveSha256": "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51",
+      "policy": "signed-amd64-dll-candidate"
+    },
+    "openfortivpnCandidate": {
+      "source": "https://github.com/adrienverge/openfortivpn/pull/1334",
+      "commit": "409de945242328d7bea6e225dcfb2f45b7fe70e5",
+      "license": "GPL-3.0-or-later",
+      "policy": "blocked-unmerged-requires-security-review-and-real-fortigate-validation"
+    }
+  }
+}

@@ -1,0 +1,20 @@
+diff --git a/src/tunnel.c b/src/tunnel.c
+index 6ea0618..d64ab1e 100644
+--- a/src/tunnel.c
++++ b/src/tunnel.c
+@@ -1408,8 +1408,13 @@ int run_tunnel(struct vpn_config *config)
+ 	log_debug("Retrieving configuration\n");
+ 	ret = auth_get_config(&tunnel);
+ 	if (ret != 1) {
+-		log_error("Could not get VPN configuration (%s).\n",
+-		          err_http_str(ret));
++		if (ret > 0) {
++			log_error("Could not get VPN configuration (HTTP status %d, stage: fortisslvpn_xml).\n",
++			          ret);
++		} else {
++			log_error("Could not get VPN configuration (%s, stage: fortisslvpn_xml).\n",
++			          err_http_str(ret));
++		}
+ 		ret = 1;
+ 		goto err_tunnel;
+ 	}

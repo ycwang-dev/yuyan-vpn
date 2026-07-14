@@ -1,0 +1,42 @@
+.fortinet-route-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.route-group {
+  display: flex;
+  min-height: 28px;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.route-group-label {
+  width: 72px;
+  flex: 0 0 72px;
+  color: var(--text-color-secondary, #94a3b8);
+}
+
+.route-empty,
+.route-help {
+  color: var(--text-color-secondary, #94a3b8);
+}
+
+.route-input-row {
+  display: flex;
+  gap: 12px;
+
+  .ant-input-affix-wrapper {
+    flex: 1;
+  }
+
+  .ant-btn {
+    flex: 0 0 auto;
+  }
+}
+
+.route-help {
+  font-size: 12px;
+  line-height: 1.6;
+}
