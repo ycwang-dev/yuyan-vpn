@@ -5640,7 +5640,7 @@ dependencies = [
 
 [[package]]
 name = "yuyan-swift-vpn"
-version = "1.0.11"
+version = "1.0.12"
 dependencies = [
  "cocoa",
  "objc",
