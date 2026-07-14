@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 
+/** 结合当前版本与当前仓库 Releases 计算下一发布版本。 */
 async function getNextVersion() {
   const tauriConfigPath = path.resolve('src-tauri/tauri.conf.json');
   if (!fs.existsSync(tauriConfigPath)) {
@@ -35,7 +36,7 @@ async function getNextVersion() {
 
   let latestVersion = '0.0.0';
   try {
-    const repo = process.env.RELEASE_REPOSITORY || process.env.GITHUB_REPOSITORY || 'ycwang-dev/yuyan-vpn-releases';
+    const repo = process.env.GITHUB_REPOSITORY || 'ycwang-dev/yuyan-vpn';
     const res = await fetch(`https://api.github.com/repos/${repo}/releases`, { headers });
     if (res.ok) {
       const releases = await res.json();

@@ -18,9 +18,6 @@ permissions:
   contents: write
   packages: read
 
-env:
-  RELEASE_REPOSITORY: ycwang-dev/yuyan-vpn-releases
-
 jobs:
   prep-version:
     runs-on: ubuntu-latest
@@ -41,14 +38,9 @@ jobs:
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          PUBLIC_RELEASE_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
         run: |
           if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
             echo 'Missing repository secret: TAURI_SIGNING_PRIVATE_KEY' >&2
-            exit 1
-          fi
-          if [ -z "$PUBLIC_RELEASE_TOKEN" ]; then
-            echo 'Missing repository secret: PUBLIC_RELEASE_TOKEN' >&2
             exit 1
           fi
 
@@ -56,8 +48,7 @@ jobs:
         id: calc
         run: node scripts/bump-version.js
         env:
-          GITHUB_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
-          RELEASE_REPOSITORY: ${{ env.RELEASE_REPOSITORY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Test updater manifest generator
         run: node --test scripts/generate-update-manifest.test.js
@@ -293,7 +284,7 @@ jobs:
           node scripts/generate-update-manifest.js
           "${{ needs.prep-version.outputs.version }}"
           "${{ needs.prep-version.outputs.tag }}"
-          "${{ env.RELEASE_REPOSITORY }}"
+          "${{ github.repository }}"
           ./dist-release
 
       - name: Create GitHub Release
@@ -301,9 +292,7 @@ jobs:
         with:
           tag_name: ${{ needs.prep-version.outputs.tag }}
           name: yuyan-vpn ${{ needs.prep-version.outputs.tag }}
-          repository: ${{ env.RELEASE_REPOSITORY }}
-          target_commitish: main
-          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           draft: false
           prerelease: ${{ needs.prep-version.outputs.prerelease == 'true' }}
           files: |
