@@ -12,7 +12,7 @@
       "commit": "a40a2d588733d48534eb78cd17b90142e5ba039b",
       "license": "GPL-3.0-or-later",
       "patches": [
-        "scripts/patches/openfortivpn-windows-http-status.patch"
+        "scripts/patches/openfortivpn-1.24.1-http-status.patch"
       ],
       "staticTls": {
         "name": "OpenSSL",
@@ -33,11 +33,14 @@
   },
   "windows": {
     "zjuConnectCandidate": {
-      "version": "1.2.0",
-      "source": "https://github.com/Mythologyli/zju-connect.git",
-      "commit": "5978df461662042cb4704488980632b23a2003c5",
+      "version": "1.2.0-pr112-windows-quicksocks",
+      "source": "https://github.com/Cuistiano/zju-connect.git",
+      "commit": "fcbb843250cafb12a99f0cb8cc3978aff4b5aaca",
       "license": "AGPL-3.0",
-      "policy": "candidate-only-not-packaged"
+      "patches": [
+        "scripts/patches/zju-connect-windows-quicksocks.patch"
+      ],
+      "policy": "windows-preview-real-atrust-validation"
     },
     "wintun": {
       "version": "0.14.1",
@@ -51,7 +54,8 @@
       "license": "GPL-3.0-or-later",
       "patches": [
         "scripts/patches/openfortivpn-windows-cleanup.patch",
-        "scripts/patches/openfortivpn-1.24.1-http-status.patch"
+        "scripts/patches/openfortivpn-windows-legacy-config.patch",
+        "scripts/patches/openfortivpn-windows-http-status.patch"
       ],
       "policy": "patched-candidate-requires-windows-10-11-real-fortigate-validation"
     }

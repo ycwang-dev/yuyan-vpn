@@ -3,7 +3,8 @@ mod ipc;
 
 use self::ipc::{HelperCommand, HelperEnvelope, HelperResponse, HELPER_ARGUMENT};
 use super::{
-    emit_vpn_log, VpnAuthPayload, VpnConfig, VpnManager, VpnStatePayload, VpnStatus, VpnType,
+    emit_vpn_log, VpnAuthPayload, VpnCaptchaPayload, VpnConfig, VpnManager, VpnStatePayload,
+    VpnStatus, VpnType,
 };
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
@@ -377,6 +378,17 @@ async fn apply_response(
     };
 
     for log in new_logs {
+        if log.vpn_type == VpnType::Atrust {
+            if let Some(url) = extract_captcha_url(&log.text) {
+                let _ = app_handle.emit(
+                    "vpn-captcha-required",
+                    VpnCaptchaPayload {
+                        vpn_type: VpnType::Atrust,
+                        url,
+                    },
+                );
+            }
+        }
         emit_vpn_log(app_handle, log.vpn_type, log.text);
     }
     for (vpn_type, previous, status, virtual_ip) in changed_states {
@@ -403,6 +415,18 @@ async fn apply_response(
         );
     }
     Ok(())
+}
+
+/** 从 zju-connect 日志中提取仅绑定本机回环地址的验证码 URL。 */
+fn extract_captcha_url(text: &str) -> Option<String> {
+    let start = text.find("http://127.0.0.1:")?;
+    let url = text[start..].split_whitespace().next()?;
+    let port = url.strip_prefix("http://127.0.0.1:")?;
+    if port.is_empty() || !port.bytes().all(|value| value.is_ascii_digit()) {
+        return None;
+    }
+    port.parse::<u16>().ok().filter(|value| *value > 0)?;
+    Some(url.to_string())
 }
 
 /** 根据 helper 状态维护 UI 侧连接计时起点。 */
@@ -552,7 +576,7 @@ fn windows_status_message(vpn_type: VpnType, status: VpnStatus) -> &'static str 
 
 #[cfg(test)]
 mod tests {
-    use super::{create_session_token, is_valid_token};
+    use super::{create_session_token, extract_captcha_url, is_valid_token};
 
     /** 会话令牌必须来自 128 位随机值并满足管道名字符约束。 */
     #[test]
@@ -562,5 +586,19 @@ mod tests {
         assert_eq!(first.len(), 32);
         assert!(is_valid_token(&first));
         assert_ne!(first, second);
+    }
+
+    /** 仅接受 zju-connect 实际启动的回环 HTTP 验证码地址。 */
+    #[test]
+    fn extracts_loopback_captcha_url() {
+        assert_eq!(
+            extract_captcha_url(
+                "2026/07/15 10:58:44 Captcha server started at http://127.0.0.1:61230"
+            ),
+            Some("http://127.0.0.1:61230".to_string())
+        );
+        assert_eq!(extract_captcha_url("https://127.0.0.1:61230"), None);
+        assert_eq!(extract_captcha_url("http://127.0.0.1:not-a-port"), None);
+        assert_eq!(extract_captcha_url("http://192.168.1.10:61230"), None);
     }
 }

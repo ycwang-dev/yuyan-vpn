@@ -602,6 +602,7 @@ async fn connect_atrust(
         .arg(&config_path)
         .current_dir(&engine_directory)
         .env("PATH", engine_runtime_path(&runtime_directory))
+        .env("YUYAN_VPN_EMBEDDED_CAPTCHA", "1")
         .creation_flags(CREATE_NEW_PROCESS_GROUP)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
