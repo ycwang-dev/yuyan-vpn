@@ -303,6 +303,8 @@ pub struct VpnManagerInner {
     pub windows_log_sequence: u64,
     #[cfg(target_os = "windows")]
     pub windows_auth_sequence: u64,
+    #[cfg(target_os = "windows")]
+    pub windows_helper_last_failure: Option<(std::time::Instant, String)>,
 }
 
 #[derive(Clone)]
@@ -349,6 +351,8 @@ impl VpnManager {
                 windows_log_sequence: 0,
                 #[cfg(target_os = "windows")]
                 windows_auth_sequence: 0,
+                #[cfg(target_os = "windows")]
+                windows_helper_last_failure: None,
             })),
             shutting_down: Arc::new(AtomicBool::new(false)),
             #[cfg(target_os = "windows")]

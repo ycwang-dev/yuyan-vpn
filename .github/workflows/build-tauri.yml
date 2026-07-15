@@ -154,15 +154,18 @@ jobs:
           set -euo pipefail
           SOURCE_DIR="$(cygpath -u "$RUNNER_TEMP")/openfortivpn-windows-source"
           OUTPUT_DIR="$(cygpath -u "$GITHUB_WORKSPACE")/windows-engine-candidate"
-          PATCH_PATH="$(cygpath -u "$GITHUB_WORKSPACE")/scripts/patches/openfortivpn-windows-cleanup.patch"
+          CLEANUP_PATCH_PATH="$(cygpath -u "$GITHUB_WORKSPACE")/scripts/patches/openfortivpn-windows-cleanup.patch"
+          HTTP_STATUS_PATCH_PATH="$(cygpath -u "$GITHUB_WORKSPACE")/scripts/patches/openfortivpn-1.24.1-http-status.patch"
           COMMIT='409de945242328d7bea6e225dcfb2f45b7fe70e5'
 
           git -c core.autocrlf=false clone --filter=blob:none --no-checkout \
             https://github.com/hkirste/openfortivpn.git "$SOURCE_DIR"
           git -C "$SOURCE_DIR" -c core.autocrlf=false checkout --detach "$COMMIT"
           test "$(git -C "$SOURCE_DIR" rev-parse HEAD)" = "$COMMIT"
-          git -C "$SOURCE_DIR" apply --check "$PATCH_PATH"
-          git -C "$SOURCE_DIR" apply "$PATCH_PATH"
+          git -C "$SOURCE_DIR" apply --check "$CLEANUP_PATCH_PATH"
+          git -C "$SOURCE_DIR" apply "$CLEANUP_PATCH_PATH"
+          git -C "$SOURCE_DIR" apply --check "$HTTP_STATUS_PATCH_PATH"
+          git -C "$SOURCE_DIR" apply "$HTTP_STATUS_PATCH_PATH"
 
           cmake -S "$SOURCE_DIR" -B "$SOURCE_DIR/build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -181,6 +184,7 @@ jobs:
           STRINGS_PATH="$(cygpath -u "$RUNNER_TEMP")/openfortivpn-windows-strings.txt"
           strings "$OUTPUT_DIR/openfortivpn.exe" > "$STRINGS_PATH"
           grep -q 'Wintun adapter destroyed' "$STRINGS_PATH"
+          grep -q 'stage: fortisslvpn_xml' "$STRINGS_PATH"
           ldd "$OUTPUT_DIR/openfortivpn.exe" | tee "$OUTPUT_DIR/openfortivpn-runtime-dependencies.txt"
           if grep -q 'not found' "$OUTPUT_DIR/openfortivpn-runtime-dependencies.txt"; then
             echo 'openfortivpn Windows 候选仍有缺失的运行库' >&2
@@ -200,6 +204,7 @@ jobs:
             'zju-connect v1.2.0 commit: 5978df461662042cb4704488980632b23a2003c5',
             'openfortivpn Windows PR candidate commit: 409de945242328d7bea6e225dcfb2f45b7fe70e5',
             'openfortivpn cleanup patch: scripts/patches/openfortivpn-windows-cleanup.patch',
+            'openfortivpn HTTP stage patch: scripts/patches/openfortivpn-1.24.1-http-status.patch',
             'Wintun 0.14.1 official signed amd64 DLL.',
             '仅允许由本工作流注入 Windows Preview 安装包；Windows 10/11 真机门禁全部通过后才允许转为正式版。'
           ) | Set-Content -Encoding UTF8 (Join-Path $OutputDir 'CANDIDATE-NOTICE.txt')
@@ -285,6 +290,7 @@ jobs:
           Copy-Item (Join-Path $CandidateDir 'openfortivpn.exe') $FortinetTarget
           Copy-Item (Join-Path $CandidateDir 'zju-connect.exe') $AtrustTarget
           Get-ChildItem $CandidateDir -Filter '*.dll' -File | Copy-Item -Destination $RuntimeDir
+          Copy-Item (Join-Path $CandidateDir 'wintun.dll') (Join-Path $BinaryDir 'wintun.dll')
           Get-ChildItem $CandidateDir -Filter 'LICENSE-*' -File | Copy-Item -Destination $LicenseDir
           Copy-Item (Join-Path $CandidateDir 'openfortivpn-runtime-dependencies.txt') $LicenseDir
           @(
@@ -294,6 +300,9 @@ jobs:
 
           if (-not (Test-Path (Join-Path $RuntimeDir 'wintun.dll'))) {
             throw 'Windows Preview 缺少官方 wintun.dll'
+          }
+          if (-not (Test-Path (Join-Path $BinaryDir 'wintun.dll'))) {
+            throw 'Windows Preview 缺少主程序同级官方 wintun.dll'
           }
           if ((Get-ChildItem $RuntimeDir -Filter '*.dll' -File).Count -lt 2) {
             throw 'Windows Preview 未收齐 openfortivpn 运行库'
@@ -410,10 +419,13 @@ jobs:
           $FortinetBinary = Join-Path $InstallDir 'openfortivpn.exe'
           $AtrustBinary = Join-Path $InstallDir 'zju-connect.exe'
           $RuntimeDir = Join-Path $InstallDir 'binaries\windows-runtime'
+          $RootWintun = Join-Path $InstallDir 'wintun.dll'
+          $RuntimeWintun = Join-Path $RuntimeDir 'wintun.dll'
           foreach ($RequiredPath in @(
             $FortinetBinary,
             $AtrustBinary,
-            (Join-Path $RuntimeDir 'wintun.dll'),
+            $RootWintun,
+            $RuntimeWintun,
             (Join-Path $RuntimeDir 'PREVIEW-NOTICE.txt')
           )) {
             if (-not (Test-Path $RequiredPath)) {
@@ -422,6 +434,23 @@ jobs:
           }
           if ((Get-ChildItem $RuntimeDir -Filter '*.dll' -File).Count -lt 2) {
             throw 'Windows 安装包未携带完整 VPN 动态运行库'
+          }
+          if ((Get-FileHash -Algorithm SHA256 $RootWintun).Hash -ne (Get-FileHash -Algorithm SHA256 $RuntimeWintun).Hash) {
+            throw 'Windows 安装包中的两份 Wintun DLL 内容不一致'
+          }
+
+          $WintunHandle = [System.Runtime.InteropServices.NativeLibrary]::Load($RootWintun)
+          try {
+            $WintunCreateAdapter = [IntPtr]::Zero
+            if (-not [System.Runtime.InteropServices.NativeLibrary]::TryGetExport(
+              $WintunHandle,
+              'WintunCreateAdapter',
+              [ref]$WintunCreateAdapter
+            )) {
+              throw '主程序同级 wintun.dll 缺少 WintunCreateAdapter 导出'
+            }
+          } finally {
+            [System.Runtime.InteropServices.NativeLibrary]::Free($WintunHandle)
           }
 
           $PreviousPath = $env:PATH

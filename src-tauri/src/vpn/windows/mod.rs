@@ -6,15 +6,25 @@ use super::{
     emit_vpn_log, VpnAuthPayload, VpnConfig, VpnManager, VpnStatePayload, VpnStatus, VpnType,
 };
 use std::ffi::OsStr;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
+use std::path::PathBuf;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::ClientOptions;
+use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 /** 单条 UI→helper IPC 报文上限。 */
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+/** helper 启动失败后的短暂冷却期，阻止一次操作连续弹出多个 UAC 窗口。 */
+const HELPER_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+/** UAC 确认后等待管理员 helper 创建安全管道的最长轮询次数。 */
+const HELPER_START_ATTEMPTS: usize = 80;
+/** 管道实例正忙时的短重试次数。 */
+const PIPE_BUSY_ATTEMPTS: usize = 20;
 
 /** 在 Tauri 启动前识别内部 helper 参数；命中时只运行管理员后端，不创建 WebView。 */
 pub fn run_helper_if_requested() -> bool {
@@ -23,18 +33,22 @@ pub fn run_helper_if_requested() -> bool {
         return false;
     };
     let Some(token) = args.get(index + 1).cloned() else {
+        append_helper_diagnostic("helper 参数缺少会话令牌");
         return true;
     };
     let Some(parent_pid) = args
         .get(index + 2)
         .and_then(|value| value.parse::<u32>().ok())
     else {
+        append_helper_diagnostic("helper 参数缺少有效父进程 PID");
         return true;
     };
     if !is_valid_token(&token) {
+        append_helper_diagnostic("helper 会话令牌格式非法");
         return true;
     }
 
+    append_helper_diagnostic(&format!("helper 启动，父进程 PID={parent_pid}"));
     let pipe_name = helper_pipe_name(&token);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -42,10 +56,14 @@ pub fn run_helper_if_requested() -> bool {
     match runtime {
         Ok(runtime) => {
             if let Err(error) = runtime.block_on(helper::run(pipe_name, token, parent_pid)) {
+                append_helper_diagnostic(&format!("helper 退出: {error}"));
                 eprintln!("Windows VPN helper 退出: {error}");
             }
         }
-        Err(error) => eprintln!("创建 Windows VPN helper 运行时失败: {error}"),
+        Err(error) => {
+            append_helper_diagnostic(&format!("创建 helper 运行时失败: {error}"));
+            eprintln!("创建 Windows VPN helper 运行时失败: {error}");
+        }
     }
     true
 }
@@ -57,17 +75,29 @@ pub async fn ensure_helper(manager: &VpnManager) -> Result<(), String> {
         return Ok(());
     }
 
+    if let Some(error) = recent_helper_failure(manager).await {
+        return Err(error);
+    }
+
     let token = create_session_token()?;
     let pipe_name = helper_pipe_name(&token);
-    launch_elevated_helper(&token)?;
+    append_helper_diagnostic("UI 请求一次管理员授权");
+    if let Err(error) = launch_elevated_helper(&token) {
+        remember_helper_failure(manager, &error).await;
+        append_helper_diagnostic(&format!("管理员授权未完成: {error}"));
+        return Err(error);
+    }
 
     let mut last_error = None;
-    for _ in 0..240 {
+    for _ in 0..HELPER_START_ATTEMPTS {
         match send_request(&pipe_name, &token, HelperCommand::Ping).await {
             Ok(response) if response.success => {
                 let mut inner = manager.inner.lock().await;
                 inner.windows_helper_pipe = Some(pipe_name);
                 inner.windows_helper_token = Some(token);
+                inner.windows_helper_last_failure = None;
+                drop(inner);
+                append_helper_diagnostic("管理员 helper 安全管道已就绪");
                 return Ok(());
             }
             Ok(response) => last_error = response.error,
@@ -75,7 +105,23 @@ pub async fn ensure_helper(manager: &VpnManager) -> Result<(), String> {
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
-    Err(last_error.unwrap_or_else(|| "等待 Windows UAC helper 启动超时".to_string()))
+    let detail = last_error.unwrap_or_else(|| "等待 Windows UAC helper 启动超时".to_string());
+    let error = format!(
+        "{detail}；不会自动重复弹出 UAC，请查看诊断日志：{}",
+        helper_diagnostic_path().display()
+    );
+    remember_helper_failure(manager, &error).await;
+    append_helper_diagnostic(&format!("管理员 helper 启动失败: {detail}"));
+    Err(error)
+}
+
+/** 连接命令只复用已授权 helper，禁止连接失败时自行重复触发 UAC。 */
+async fn require_helper(manager: &VpnManager) -> Result<(), String> {
+    if helper_is_available(manager).await {
+        Ok(())
+    } else {
+        Err("Windows 管理员 helper 尚未就绪；请重新点击连接并只确认一次 UAC 授权".to_string())
+    }
 }
 
 /** 检查当前 helper 会话是否仍可响应，不把 UAC 状态伪装成 sudo 密码。 */
@@ -110,7 +156,7 @@ pub async fn connect_fortinet(
     password: String,
 ) -> Result<(), String> {
     manager.ensure_connections_allowed()?;
-    ensure_helper(manager).await?;
+    require_helper(manager).await?;
     let response =
         request_with_session(manager, HelperCommand::ConnectFortinet { config, password }).await?;
     apply_response(app_handle, manager, response).await
@@ -124,7 +170,7 @@ pub async fn connect_atrust(
     password: String,
 ) -> Result<(), String> {
     manager.ensure_connections_allowed()?;
-    ensure_helper(manager).await?;
+    require_helper(manager).await?;
     let response =
         request_with_session(manager, HelperCommand::ConnectAtrust { config, password }).await?;
     apply_response(app_handle, manager, response).await
@@ -203,9 +249,7 @@ async fn send_request(
     token: &str,
     command: HelperCommand,
 ) -> Result<HelperResponse, String> {
-    let mut pipe = ClientOptions::new()
-        .open(pipe_name)
-        .map_err(|error| format!("连接 Windows VPN helper 失败: {error}"))?;
+    let mut pipe = open_helper_pipe(pipe_name).await?;
     let envelope = HelperEnvelope {
         token: token.to_string(),
         command,
@@ -239,6 +283,34 @@ async fn send_request(
         .map_err(|error| format!("读取 Windows VPN helper 响应失败: {error}"))?;
     serde_json::from_slice(&response)
         .map_err(|error| format!("解析 Windows VPN helper 响应失败: {error}"))
+}
+
+/** 打开 helper 管道；仅对“管道正忙”做短重试，不掩盖 ACL 等真实错误。 */
+async fn open_helper_pipe(
+    pipe_name: &str,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, String> {
+    let mut last_error = None;
+    for attempt in 0..PIPE_BUSY_ATTEMPTS {
+        match ClientOptions::new().open(pipe_name) {
+            Ok(pipe) => return Ok(pipe),
+            Err(error)
+                if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
+                    && attempt + 1 < PIPE_BUSY_ATTEMPTS =>
+            {
+                last_error = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            Err(error) => {
+                return Err(format!("连接 Windows VPN helper 失败: {error}"));
+            }
+        }
+    }
+    Err(format!(
+        "连接 Windows VPN helper 失败: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "命名管道持续繁忙".to_string())
+    ))
 }
 
 /** 把 helper 响应合并到现有跨平台状态机并发送前端事件。 */
@@ -380,6 +452,56 @@ fn is_valid_token(token: &str) -> bool {
 /** 根据会话令牌生成仅限本机的命名管道路径。 */
 fn helper_pipe_name(token: &str) -> String {
     format!(r"\\.\pipe\yuyan-swift-vpn-{token}")
+}
+
+/** 读取短期 helper 失败状态，避免用户一次操作造成 UAC 连续弹窗。 */
+async fn recent_helper_failure(manager: &VpnManager) -> Option<String> {
+    let inner = manager.inner.lock().await;
+    inner
+        .windows_helper_last_failure
+        .as_ref()
+        .filter(|(failed_at, _)| failed_at.elapsed() < HELPER_FAILURE_COOLDOWN)
+        .map(|(_, error)| format!("{error}；请稍候再重试"))
+}
+
+/** 记录最近一次 helper 启动失败，供 UAC 冷却门禁使用。 */
+async fn remember_helper_failure(manager: &VpnManager, error: &str) {
+    let mut inner = manager.inner.lock().await;
+    inner.windows_helper_last_failure = Some((std::time::Instant::now(), error.to_string()));
+}
+
+/** 返回当前用户可读取、且不位于安装目录中的 Windows helper 诊断日志。 */
+fn helper_diagnostic_path() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("cn.yuyan.swiftvpn")
+        .join("logs")
+        .join("windows-helper.log")
+}
+
+/** 追加不含令牌、账号和密码的 helper 启动诊断，便于普通权限场景排障。 */
+pub(super) fn append_helper_diagnostic(event: &str) {
+    let path = helper_diagnostic_path();
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let sanitized = event.replace('\r', " ").replace('\n', " ");
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(
+            file,
+            "{timestamp} pid={} {}",
+            std::process::id(),
+            sanitized.chars().take(1000).collect::<String>()
+        );
+    }
 }
 
 /** 通过 Windows UAC 的 runas 动词启动同一签名 exe 的 helper 模式。 */

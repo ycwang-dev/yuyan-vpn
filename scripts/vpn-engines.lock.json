@@ -50,7 +50,8 @@
       "commit": "409de945242328d7bea6e225dcfb2f45b7fe70e5",
       "license": "GPL-3.0-or-later",
       "patches": [
-        "scripts/patches/openfortivpn-windows-cleanup.patch"
+        "scripts/patches/openfortivpn-windows-cleanup.patch",
+        "scripts/patches/openfortivpn-1.24.1-http-status.patch"
       ],
       "policy": "patched-candidate-requires-windows-10-11-real-fortigate-validation"
     }

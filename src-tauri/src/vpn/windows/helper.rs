@@ -11,7 +11,11 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows_sys::Win32::System::Console::{
     AllocConsole, GenerateConsoleCtrlEvent, GetConsoleWindow, SetConsoleCtrlHandler,
     CTRL_BREAK_EVENT,
@@ -39,6 +43,65 @@ const ATRUST_INTERFACE: &str = "ZJU Connect";
 /** 当前 FortiGate 证书白名单摘要，与既有 macOS 连接策略保持一致。 */
 const FORTINET_TRUSTED_CERT: &str =
     "491a5bbe4cc44c3e42141d9babfbdd29eee75aaf36401221a1dac9305c846b56";
+/**
+ * 管道只允许本机 SYSTEM、管理员和交互式登录用户访问，并把完整性标签降为 Medium。
+ * 随机管道名与 128 位会话令牌仍是命令授权边界；该 ACL 只解决同一用户中/高完整性进程互通。
+ */
+const PIPE_SECURITY_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)S:(ML;;NW;;;ME)";
+
+/** 持有由 Win32 分配的命名管道安全描述符，创建管道后自动释放。 */
+struct PipeSecurity {
+    descriptor: PSECURITY_DESCRIPTOR,
+    attributes: SECURITY_ATTRIBUTES,
+}
+
+impl PipeSecurity {
+    /** 从固定 SDDL 创建允许普通 UI 连接管理员 helper 的安全属性。 */
+    fn new() -> Result<Self, String> {
+        let sddl = PIPE_SECURITY_SDDL
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let converted = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        };
+        if converted == 0 || descriptor.is_null() {
+            return Err(format!(
+                "创建 Windows helper 管道安全描述符失败: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self {
+            descriptor,
+            attributes: SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor,
+                bInheritHandle: 0,
+            },
+        })
+    }
+
+    /** 返回 Tokio 创建命名管道所需的 SECURITY_ATTRIBUTES 指针。 */
+    fn as_raw(&mut self) -> *mut c_void {
+        &mut self.attributes as *mut SECURITY_ATTRIBUTES as *mut c_void
+    }
+}
+
+impl Drop for PipeSecurity {
+    fn drop(&mut self) {
+        if !self.descriptor.is_null() {
+            unsafe {
+                let _ = LocalFree(self.descriptor as HLOCAL);
+            }
+        }
+    }
+}
 
 /** helper 中单个引擎的运行态；所有字段只存在管理员进程内存中。 */
 struct EngineRuntime {
@@ -194,35 +257,50 @@ impl Drop for JobHandle {
 /** 运行无 WebView 的管理员 helper，直到 UI 父进程退出或收到 Shutdown。 */
 pub async fn run(pipe_name: String, token: String, parent_pid: u32) -> Result<(), String> {
     initialize_hidden_console();
+    super::append_helper_diagnostic("helper 初始化隐藏控制台完成");
     let job = Arc::new(JobHandle::new()?);
     let state = Arc::new(Mutex::new(HelperState::default()));
     let (parent_exit_tx, mut parent_exit_rx) = tokio::sync::oneshot::channel::<()>();
     monitor_parent(parent_pid, parent_exit_tx)?;
+    let mut pipe_security = PipeSecurity::new()?;
+    super::append_helper_diagnostic("helper 中完整性命名管道 ACL 已创建");
 
     let mut first_instance = true;
+    let mut first_client_logged = false;
     loop {
-        let server = ServerOptions::new()
-            .first_pipe_instance(first_instance)
-            .reject_remote_clients(true)
-            .create(&pipe_name)
-            .map_err(|error| format!("创建 Windows helper 命名管道失败: {error}"))?;
+        let server = unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(first_instance)
+                .reject_remote_clients(true)
+                .create_with_security_attributes_raw(&pipe_name, pipe_security.as_raw())
+        }
+        .map_err(|error| format!("创建 Windows helper 命名管道失败: {error}"))?;
+        if first_instance {
+            super::append_helper_diagnostic("helper 首个命名管道实例等待 UI 连接");
+        }
         first_instance = false;
 
         tokio::select! {
             connected = server.connect() => {
                 connected.map_err(|error| format!("接受 Windows helper 管道连接失败: {error}"))?;
+                if !first_client_logged {
+                    super::append_helper_diagnostic("helper 已接受普通权限 UI 管道连接");
+                    first_client_logged = true;
+                }
                 let should_stop = handle_connection(server, &token, &state, &job).await?;
                 if should_stop {
                     break;
                 }
             }
             _ = &mut parent_exit_rx => {
+                super::append_helper_diagnostic("UI 父进程已退出，helper 开始清理");
                 break;
             }
         }
     }
 
     shutdown_all(&state).await;
+    super::append_helper_diagnostic("helper 已完成 VPN 子进程与路由清理");
     Ok(())
 }
 
@@ -405,6 +483,7 @@ async fn connect_fortinet(
 
     let binary = engine_path("openfortivpn.exe")?;
     ensure_engine_files(&binary, true)?;
+    let engine_directory = engine_directory()?;
     let runtime_directory = engine_runtime_directory()?;
     let mut command = Command::new(&binary);
     command
@@ -418,7 +497,7 @@ async fn connect_fortinet(
         .arg("--min-tls=1.0")
         .arg("--cipher-list=DHE-RSA-AES256-SHA:@SECLEVEL=0")
         .arg("-v")
-        .current_dir(&runtime_directory)
+        .current_dir(&engine_directory)
         .env("PATH", engine_runtime_path(&runtime_directory))
         .creation_flags(CREATE_NEW_PROCESS_GROUP)
         .stdin(Stdio::piped())
@@ -496,6 +575,7 @@ async fn connect_atrust(
 
     let binary = engine_path("zju-connect.exe")?;
     ensure_engine_files(&binary, true)?;
+    let engine_directory = engine_directory()?;
     let runtime_directory = engine_runtime_directory()?;
     let config_path = unique_temp_path("atrust", "toml");
     let toml = build_atrust_config(&config, &password);
@@ -520,7 +600,7 @@ async fn connect_atrust(
     command
         .arg("-config")
         .arg(&config_path)
-        .current_dir(&runtime_directory)
+        .current_dir(&engine_directory)
         .env("PATH", engine_runtime_path(&runtime_directory))
         .creation_flags(CREATE_NEW_PROCESS_GROUP)
         .stdin(Stdio::piped())
@@ -1071,6 +1151,9 @@ fn engine_runtime_directory() -> Result<PathBuf, String> {
 /** 将 VPN 运行库目录置于子进程 PATH 首位，避免加载系统中的同名 DLL。 */
 fn engine_runtime_path(runtime_directory: &Path) -> std::ffi::OsString {
     let mut paths = vec![runtime_directory.to_path_buf()];
+    if let Ok(directory) = engine_directory() {
+        paths.push(directory);
+    }
     if let Some(existing) = std::env::var_os("PATH") {
         paths.extend(std::env::split_paths(&existing));
     }
@@ -1083,10 +1166,10 @@ fn ensure_engine_files(binary: &Path, require_wintun: bool) -> Result<(), String
         return Err(format!("Windows 安装包缺少 VPN 引擎: {}", binary.display()));
     }
     if require_wintun {
-        let wintun = engine_runtime_directory()?.join("wintun.dll");
+        let wintun = engine_directory()?.join("wintun.dll");
         if !wintun.is_file() {
             return Err(format!(
-                "Windows 安装包缺少官方 Wintun: {}",
+                "Windows 安装包缺少主程序同级官方 Wintun: {}",
                 wintun.display()
             ));
         }
@@ -1171,7 +1254,16 @@ fn is_mfa_prompt(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_ipv4_cidr, toml_escape};
+    use super::{is_valid_ipv4_cidr, toml_escape, PIPE_SECURITY_SDDL};
+
+    /** 管道 ACL 必须同时保留本机身份限制与 Medium 完整性标签。 */
+    #[test]
+    fn pipe_security_allows_medium_integrity_local_ui() {
+        assert!(PIPE_SECURITY_SDDL.contains("(A;;GA;;;SY)"));
+        assert!(PIPE_SECURITY_SDDL.contains("(A;;GA;;;BA)"));
+        assert!(PIPE_SECURITY_SDDL.contains("(A;;GA;;;IU)"));
+        assert!(PIPE_SECURITY_SDDL.contains("S:(ML;;NW;;;ME)"));
+    }
 
     /** 服务端日志只有合法的非默认 IPv4 CIDR 才能进入 netsh 参数。 */
     #[test]

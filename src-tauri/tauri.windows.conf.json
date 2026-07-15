@@ -4,8 +4,9 @@
       "binaries/openfortivpn",
       "binaries/zju-connect"
     ],
-    "resources": [
-      "binaries/windows-runtime/**/*"
-    ]
+    "resources": {
+      "binaries/wintun.dll": "wintun.dll",
+      "binaries/windows-runtime": "binaries/windows-runtime"
+    }
   }
 }
