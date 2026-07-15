@@ -1,4 +1,6 @@
-use super::{atrust, fortinet, VpnManager, VpnStatus};
+#[cfg(not(target_os = "windows"))]
+use super::{atrust, fortinet};
+use super::{VpnManager, VpnStatus};
 use tauri::{AppHandle, Emitter};
 
 /** 安全退出清理状态，供前端显示失败原因。 */

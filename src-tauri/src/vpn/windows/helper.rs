@@ -247,7 +247,9 @@ fn monitor_parent(parent_pid: u32, sender: tokio::sync::oneshot::Sender<()>) -> 
             std::io::Error::last_os_error()
         ));
     }
+    let process_handle = process as usize;
     std::thread::spawn(move || {
+        let process = process_handle as HANDLE;
         unsafe {
             let _ = WaitForSingleObject(process, INFINITE);
             CloseHandle(process);

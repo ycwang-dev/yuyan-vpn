@@ -1,11 +1,17 @@
+#[cfg(target_os = "macos")]
+use super::resolve_macos_sidecar;
 use super::{
-    emit_vpn_log, load_vpn_config, resolve_macos_sidecar, validate_vpn_connection_config,
-    VpnCaptchaPayload, VpnManager, VpnManagerInner, VpnStatePayload, VpnStatus, VpnType,
+    emit_vpn_log, load_vpn_config, validate_vpn_connection_config, VpnCaptchaPayload, VpnManager,
+    VpnManagerInner, VpnStatePayload, VpnStatus, VpnType,
 };
 use std::process::Stdio;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, Manager};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(target_os = "macos")]
+use tauri::Manager;
+use tauri::{AppHandle, Emitter};
+use tokio::io::AsyncWriteExt;
+#[cfg(target_os = "macos")]
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::Mutex;
 
 /// 将用户输入编码为 TOML 基本字符串内容，防止引号或换行破坏运行时配置。

@@ -1,9 +1,11 @@
-use super::network_guard::{
-    follow_mihomo_interface, pin_mihomo_interface, restore_mihomo_interface,
-};
+#[cfg(target_os = "macos")]
+use super::network_guard::pin_mihomo_interface;
+use super::network_guard::{follow_mihomo_interface, restore_mihomo_interface};
+#[cfg(target_os = "macos")]
+use super::resolve_macos_sidecar;
 use super::{
-    emit_vpn_log, load_vpn_config, resolve_macos_sidecar, validate_vpn_connection_config,
-    VpnManager, VpnManagerInner, VpnStatePayload, VpnStatus, VpnType,
+    emit_vpn_log, load_vpn_config, validate_vpn_connection_config, VpnManager, VpnManagerInner,
+    VpnStatePayload, VpnStatus, VpnType,
 };
 use std::collections::HashSet;
 #[cfg(unix)]
