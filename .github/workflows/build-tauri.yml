@@ -155,7 +155,7 @@ jobs:
           SOURCE_DIR="$(cygpath -u "$RUNNER_TEMP")/openfortivpn-windows-source"
           OUTPUT_DIR="$(cygpath -u "$GITHUB_WORKSPACE")/windows-engine-candidate"
           CLEANUP_PATCH_PATH="$(cygpath -u "$GITHUB_WORKSPACE")/scripts/patches/openfortivpn-windows-cleanup.patch"
-          HTTP_STATUS_PATCH_PATH="$(cygpath -u "$GITHUB_WORKSPACE")/scripts/patches/openfortivpn-1.24.1-http-status.patch"
+          HTTP_STATUS_PATCH_PATH="$(cygpath -u "$GITHUB_WORKSPACE")/scripts/patches/openfortivpn-windows-http-status.patch"
           COMMIT='409de945242328d7bea6e225dcfb2f45b7fe70e5'
 
           git -c core.autocrlf=false clone --filter=blob:none --no-checkout \
@@ -204,7 +204,7 @@ jobs:
             'zju-connect v1.2.0 commit: 5978df461662042cb4704488980632b23a2003c5',
             'openfortivpn Windows PR candidate commit: 409de945242328d7bea6e225dcfb2f45b7fe70e5',
             'openfortivpn cleanup patch: scripts/patches/openfortivpn-windows-cleanup.patch',
-            'openfortivpn HTTP stage patch: scripts/patches/openfortivpn-1.24.1-http-status.patch',
+            'openfortivpn HTTP stage patch: scripts/patches/openfortivpn-windows-http-status.patch',
             'Wintun 0.14.1 official signed amd64 DLL.',
             '仅允许由本工作流注入 Windows Preview 安装包；Windows 10/11 真机门禁全部通过后才允许转为正式版。'
           ) | Set-Content -Encoding UTF8 (Join-Path $OutputDir 'CANDIDATE-NOTICE.txt')

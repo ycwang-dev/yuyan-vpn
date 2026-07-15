@@ -12,7 +12,7 @@
       "commit": "a40a2d588733d48534eb78cd17b90142e5ba039b",
       "license": "GPL-3.0-or-later",
       "patches": [
-        "scripts/patches/openfortivpn-1.24.1-http-status.patch"
+        "scripts/patches/openfortivpn-windows-http-status.patch"
       ],
       "staticTls": {
         "name": "OpenSSL",
