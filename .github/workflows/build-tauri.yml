@@ -362,6 +362,7 @@ jobs:
           else
             "$OPENFORTIVPN" --version | grep -q '1.24.1'
             grep -a -q 'stage: fortisslvpn_xml' "$OPENFORTIVPN"
+            grep -a -q 'Legacy FortiOS VPN configuration accepted' "$OPENFORTIVPN"
           fi
           for binary in "$OPENFORTIVPN" "$ZJU_CONNECT"; do
             test -x "$binary"
