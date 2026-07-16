@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 const UPDATE_TARGETS = {
   'darwin-aarch64': '.app.tar.gz',
   'darwin-x86_64': '.app.tar.gz',
+  'windows-x86_64': '.exe',
 };
 
 /** 递归读取目录中的全部文件。 */
@@ -44,13 +45,15 @@ export const generateUpdateManifest = ({
   const files = listFiles(distDirectory);
   const platforms = Object.fromEntries(Object.entries(UPDATE_TARGETS).map(([target, extension]) => {
     const targetDirectory = `${path.sep}${target}${path.sep}`;
-    const artifact = files.find((file) => file.includes(targetDirectory)
+    const artifacts = files.filter((file) => file.includes(targetDirectory)
       && file.endsWith(extension)
       && !file.endsWith('.sig'));
-    if (!artifact) throw new Error(`缺少 ${target} 更新产物 ${extension}`);
+    if (!artifacts.length) throw new Error(`缺少 ${target} 更新产物 ${extension}`);
+
+    const artifact = artifacts.find((file) => fs.existsSync(`${file}.sig`));
+    if (!artifact) throw new Error(`缺少更新签名：${artifacts[0]}.sig`);
 
     const signaturePath = `${artifact}.sig`;
-    if (!fs.existsSync(signaturePath)) throw new Error(`缺少更新签名：${signaturePath}`);
     const signature = fs.readFileSync(signaturePath, 'utf8').trim();
     if (!signature) throw new Error(`更新签名为空：${signaturePath}`);
 

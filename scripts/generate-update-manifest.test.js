@@ -14,10 +14,15 @@ const createSignedArtifact = (root, target, filename) => {
   fs.writeFileSync(`${artifactPath}.sig`, `signature-${target}\n`);
 };
 
-test('生成包含 macOS 双架构签名资产的 latest.json', () => {
+test('生成包含 macOS 双架构与 Windows x86_64 签名资产的 latest.json', () => {
   const distDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'yuyan-update-manifest-'));
   createSignedArtifact(distDirectory, 'darwin-aarch64', 'yuyan_1.2.3_darwin-aarch64.app.tar.gz');
   createSignedArtifact(distDirectory, 'darwin-x86_64', 'yuyan_1.2.3_darwin-x86_64.app.tar.gz');
+  createSignedArtifact(distDirectory, 'windows-x86_64', 'yuyan_1.2.3_windows-x86_64-setup.exe');
+  fs.writeFileSync(
+    path.join(distDirectory, 'windows-x86_64', 'a-unsigned-installer.exe'),
+    'unsigned-bundle-copy',
+  );
 
   const manifest = generateUpdateManifest({
     version: '1.2.3',
@@ -30,9 +35,11 @@ test('生成包含 macOS 双架构签名资产的 latest.json', () => {
   assert.deepEqual(Object.keys(manifest.platforms), [
     'darwin-aarch64',
     'darwin-x86_64',
+    'windows-x86_64',
   ]);
   assert.equal(manifest.platforms['darwin-aarch64'].signature, 'signature-darwin-aarch64');
   assert.match(manifest.platforms['darwin-x86_64'].url, /v1.2.3\/yuyan_1.2.3_darwin-x86_64.app.tar.gz$/);
+  assert.match(manifest.platforms['windows-x86_64'].url, /v1.2.3\/yuyan_1.2.3_windows-x86_64-setup.exe$/);
   assert.deepEqual(
     JSON.parse(fs.readFileSync(path.join(distDirectory, 'latest.json'), 'utf8')),
     manifest,
@@ -42,6 +49,7 @@ test('生成包含 macOS 双架构签名资产的 latest.json', () => {
 test('缺少签名时拒绝生成更新清单', () => {
   const distDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'yuyan-update-manifest-missing-'));
   createSignedArtifact(distDirectory, 'darwin-aarch64', 'yuyan_1.2.3_darwin-aarch64.app.tar.gz');
+  createSignedArtifact(distDirectory, 'windows-x86_64', 'yuyan_1.2.3_windows-x86_64-setup.exe');
   const intelDirectory = path.join(distDirectory, 'darwin-x86_64');
   fs.mkdirSync(intelDirectory, { recursive: true });
   fs.writeFileSync(path.join(intelDirectory, 'yuyan_1.2.3_darwin-x86_64.app.tar.gz'), 'unsigned');

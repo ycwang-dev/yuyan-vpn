@@ -41,7 +41,7 @@
       "patches": [
         "scripts/patches/zju-connect-windows-quicksocks.patch"
       ],
-      "policy": "windows-preview-real-atrust-validation"
+      "policy": "windows-stable-physical-atrust-validated"
     },
     "wintun": {
       "version": "0.14.1",
@@ -58,7 +58,7 @@
         "scripts/patches/openfortivpn-windows-legacy-config.patch",
         "scripts/patches/openfortivpn-windows-http-status.patch"
       ],
-      "policy": "patched-candidate-requires-windows-10-11-real-fortigate-validation"
+      "policy": "patched-stable-physical-fortigate-validated"
     }
   }
 }
