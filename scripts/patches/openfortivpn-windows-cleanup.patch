@@ -1,0 +1,103 @@
+diff --git a/src/ipv4_win.c b/src/ipv4_win.c
+index ca79ceb..f2e6a65 100644
+--- a/src/ipv4_win.c
++++ b/src/ipv4_win.c
+@@ -130,6 +130,28 @@ static int del_route(MIB_IPFORWARD_ROW2 *row)
+ 	return 0;
+ }
+ 
++/* Delete a route using the same key fields that were used when adding it. */
++static int del_route_by_key(struct in_addr dest, struct in_addr mask,
++                            struct in_addr gateway, NET_LUID *luid)
++{
++	MIB_IPFORWARD_ROW2 row;
++	uint32_t m;
++
++	InitializeIpForwardEntry(&row);
++	if (luid)
++		row.InterfaceLuid = *luid;
++	row.DestinationPrefix.Prefix.Ipv4.sin_family = AF_INET;
++	row.DestinationPrefix.Prefix.Ipv4.sin_addr = dest;
++	m = ntohl(mask.s_addr);
++	while (m & 0x80000000) {
++		row.DestinationPrefix.PrefixLength++;
++		m <<= 1;
++	}
++	row.NextHop.Ipv4.sin_family = AF_INET;
++	row.NextHop.Ipv4.sin_addr = gateway;
++	return del_route(&row);
++}
++
+ /*
+  * Save the current default route for later restoration.
+  */
+@@ -218,7 +240,8 @@ int ipv4_set_tunnel_routes(struct tunnel *tunnel)
+ 		struct in_addr saved_gw;
+ 
+ 		saved_gw = saved_default_route.row.NextHop.Ipv4.sin_addr;
+-		ret = add_route(gateway_ip, full_mask, saved_gw, NULL, 0);
++		ret = add_route(gateway_ip, full_mask, saved_gw,
++		                &saved_default_route.row.InterfaceLuid, 0);
+ 		if (ret) {
+ 			log_warn("Could not add route to VPN gateway.\n");
+ 			if (tunnel->ipv4.split_routes == 0)
+@@ -289,6 +312,16 @@ int ipv4_restore_routes(struct tunnel *tunnel)
+ 	full_mask.s_addr = htonl(0xFFFFFFFF);
+ 	half_mask.s_addr = htonl(0x80000000);
+ 
++	/* Remove every split route created for this adapter. */
++	if (tun_luid_valid) {
++		for (int i = 0; i < tunnel->ipv4.split_routes; i++) {
++			struct rtentry *rt = &tunnel->ipv4.split_rt[i];
++
++			del_route_by_key(route_dest(rt), route_mask(rt),
++			                 route_gtw(rt), &tun_luid);
++		}
++	}
++
+ 	/* Remove VPN default routes */
+ 	if (tun_luid_valid) {
+ 		MIB_IPFORWARD_ROW2 row;
+@@ -339,6 +372,8 @@ int ipv4_restore_routes(struct tunnel *tunnel)
+ 		del_route(&row);
+ 		tunnel->ipv4.route_to_vpn_is_added = 0;
+ 	}
++	tun_luid_valid = 0;
++	saved_default_route.valid = 0;
+ 
+ 	return ret;
+ }
+diff --git a/src/tunnel_win.c b/src/tunnel_win.c
+index 79db153..60e08fb 100644
+--- a/src/tunnel_win.c
++++ b/src/tunnel_win.c
+@@ -52,6 +52,7 @@
+ 
+ static struct wintun_api wt_api;
+ static int wt_api_loaded;
++static WINTUN_ADAPTER_HANDLE wt_adapter;
+ 
+ /*
+  * Load wintun.dll and create a TUN adapter.
+@@ -95,6 +96,7 @@ static int wintun_create(struct tunnel *tunnel)
+ 		wt_api.CloseAdapter(adapter);
+ 		return 1;
+ 	}
++	wt_adapter = adapter;
+ 
+ 	/*
+ 	 * Store handles in tunnel struct.
+@@ -148,8 +150,11 @@ static void wintun_destroy(struct tunnel *tunnel)
+ 		tunnel->tun_session = NULL;
+ 	}
+ 
+-	/* Close adapter - remove it from Windows */
+-	/* Note: adapter handle is managed via wt_api, not stored separately */
++	/* Close adapter - remove it from Windows. */
++	if (wt_adapter) {
++		wt_api.CloseAdapter(wt_adapter);
++		wt_adapter = NULL;
++	}
+ 
+ 	log_info("Wintun adapter destroyed.\n");
+ }

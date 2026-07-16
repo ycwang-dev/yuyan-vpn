@@ -1,0 +1,202 @@
+diff --git a/client/atrust/auth/auth.go b/client/atrust/auth/auth.go
+index c5c9590..5b886e2 100644
+--- a/client/atrust/auth/auth.go
++++ b/client/atrust/auth/auth.go
+@@ -22,8 +22,8 @@ const (
+ 
+ var sharedParams = url.Values{
+ 	"clientType": {"SDPClient"},
+-	"platform":   {"Linux"},
+-	"lang":       {"en-US"},
++	"platform":   {"Windows"},
++	"lang":       {"zh-CN"},
+ }
+ 
+ func WithSharedParams(extra url.Values) url.Values {
+diff --git a/client/atrust/auth/captcha_server.go b/client/atrust/auth/captcha_server.go
+index dfd8c8a..ac3738d 100644
+--- a/client/atrust/auth/captcha_server.go
++++ b/client/atrust/auth/captcha_server.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"net"
+ 	"net/http"
++	"os"
+ 	"os/exec"
+ 	"runtime"
+ 	"time"
+@@ -368,6 +369,11 @@ func serveCaptchaInBrowser(imgData []byte, timeout time.Duration) (string, error
+ 
+ // openBrowser tries to open the given URL in the system's default browser.
+ func openBrowser(url string) {
++	if os.Getenv("YUYAN_VPN_EMBEDDED_CAPTCHA") == "1" {
++		log.Printf("Embedded captcha requested; waiting for app WebView at %s", url)
++		return
++	}
++
+ 	var cmd *exec.Cmd
+ 	switch runtime.GOOS {
+ 	case "darwin":
+diff --git a/client/atrust/tcptunnel.go b/client/atrust/tcptunnel.go
+index 4c2ce67..57fcd90 100644
+--- a/client/atrust/tcptunnel.go
++++ b/client/atrust/tcptunnel.go
+@@ -24,9 +24,13 @@ type tcpTunnelConn struct {
+ 	tlsConn net.Conn
+ 	reader  *bufio.Reader
+ 	readBuf []byte
++	quick   bool
+ }
+ 
+ func (c *tcpTunnelConn) Read(b []byte) (int, error) {
++	if c.quick {
++		return c.reader.Read(b)
++	}
+ 	if len(c.readBuf) > 0 {
+ 		n := copy(b, c.readBuf)
+ 		c.readBuf = c.readBuf[n:]
+@@ -69,7 +73,7 @@ func (c *tcpTunnelConn) Read(b []byte) (int, error) {
+ 			}
+ 
+ 			if header[0] == 0x30 && header[1] == 0x30 {
+-				log.DebugPrint("Received close message")
++				log.Println("aTrust TCP tunnel: server sent close frame")
+ 				_ = c.tlsConn.Close()
+ 				return 0, fmt.Errorf("connection closed by server")
+ 			}
+@@ -87,7 +91,8 @@ func (c *tcpTunnelConn) Read(b []byte) (int, error) {
+ 				return 0, err
+ 			}
+ 
+-			log.DebugPrint("Received protocol response:")
++			log.Printf("aTrust TCP tunnel: protocol response received, length=%d, accepted=%t", length, strings.Contains(string(data), "OK"))
++			log.Printf("aTrust TCP tunnel: protocol response=%q", string(data))
+ 			log.DebugDumpHex(data)
+ 
+ 			if !strings.Contains(string(data), "OK") {
+@@ -105,6 +110,9 @@ func (c *tcpTunnelConn) Read(b []byte) (int, error) {
+ }
+ 
+ func (c *tcpTunnelConn) Write(b []byte) (int, error) {
++	if c.quick {
++		return c.tlsConn.Write(b)
++	}
+ 	header := []byte{0x01, 0x00}
+ 	length := len(b)
+ 	if length > 0xFFFF {
+@@ -123,6 +131,9 @@ func (c *tcpTunnelConn) Write(b []byte) (int, error) {
+ }
+ 
+ func (c *tcpTunnelConn) Close() error {
++	if c.quick {
++		return c.tlsConn.Close()
++	}
+ 	closeMsg := []byte{0x01, 0x01, 0x00, 0x00}
+ 	_, _ = c.tlsConn.Write(closeMsg)
+ 	log.DebugPrint("Sent close message")
+@@ -130,6 +141,49 @@ func (c *tcpTunnelConn) Close() error {
+ 	return c.tlsConn.Close()
+ }
+ 
++func negotiateQuickSocks5(conn net.Conn, reader *bufio.Reader) error {
++	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
++		return err
++	}
++	defer conn.SetReadDeadline(time.Time{})
++
++	header := make([]byte, 2)
++	if _, err := io.ReadFull(reader, header); err != nil {
++		return fmt.Errorf("read quick SOCKS5 greeting: %w", err)
++	}
++	if header[0] == 0x05 && header[1] == 0x81 {
++		if _, err := io.ReadFull(reader, header); err != nil {
++			return fmt.Errorf("read quick SOCKS5 protocol header: %w", err)
++		}
++	}
++	if header[0] != 0x53 || header[1] != 0x00 {
++		return fmt.Errorf("unexpected quick SOCKS5 protocol header: %02X %02X", header[0], header[1])
++	}
++
++	lengthBytes := make([]byte, 2)
++	if _, err := io.ReadFull(reader, lengthBytes); err != nil {
++		return fmt.Errorf("read quick SOCKS5 protocol length: %w", err)
++	}
++	length := binary.BigEndian.Uint16(lengthBytes)
++	response := make([]byte, length)
++	if _, err := io.ReadFull(reader, response); err != nil {
++		return fmt.Errorf("read quick SOCKS5 protocol response: %w", err)
++	}
++	if !strings.Contains(string(response), `"message":"OK"`) {
++		return fmt.Errorf("quick SOCKS5 initialization rejected: %s", string(response))
++	}
++
++	socksReply := make([]byte, 10)
++	if _, err := io.ReadFull(reader, socksReply); err != nil {
++		return fmt.Errorf("read quick SOCKS5 destination response: %w", err)
++	}
++	if socksReply[0] != 0x05 || socksReply[1] != 0x00 {
++		return fmt.Errorf("quick SOCKS5 destination rejected: %02X %02X", socksReply[0], socksReply[1])
++	}
++	log.Println("aTrust TCP tunnel: Quick SOCKS5 negotiation completed")
++	return nil
++}
++
+ func (c *tcpTunnelConn) LocalAddr() net.Addr {
+ 	return c.tlsConn.LocalAddr()
+ }
+@@ -202,8 +256,14 @@ func (c *Client) DialTCP(ctx context.Context, addr *net.TCPAddr) (net.Conn, erro
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to connect to aTrust server: %w", err)
+ 	}
+-	procName := "google-chrome-stable"
+-	procPath := "/usr/bin/google-chrome-stable"
++	log.Printf("aTrust TCP tunnel: TLS connected, node=%s, target=%s, appIDPresent=%t", nodeAddr, addr.String(), appID != "")
++	// The aTrust gateway authorizes the data-plane tunnel by the self-reported
++	// process identity (platform + procHash of procPath). The company gateway only
++	// trusts the identity our macOS build ships, so mirror it verbatim regardless of
++	// the host OS; a Windows/chrome.exe identity is rejected right after the 05 81 ack.
++	procName := "Google Chrome Helper"
++	procPath := "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/Current/Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper"
++	platform := "macOS"
+ 	if addr.Port == 22 {
+ 		procName = "ssh"
+ 		procPath = "/usr/bin/ssh"
+@@ -224,8 +284,8 @@ func (c *Client) DialTCP(ctx context.Context, addr *net.TCPAddr) (net.Conn, erro
+ 	binary.BigEndian.PutUint16(destPort, uint16(addr.Port))
+ 
+ 	msg := fmt.Sprintf(
+-		`{"sid":"%s","appId":"%s","url":"tcp://%s","deviceId":"%s","connectionId":"%s","procHash":"%s","userName":"%s","rcAppliedInfo":0,"lang":"en-US","destAddr":"%s","env":{"application":{"runtime":{"process":{"name":"%s","digital_signature":"TrustAppClosed","platform":"Linux","fingerprint":"%s","description":"TrustAppClosed","path":"%s","version":"TrustAppClosed","security_env":"normal"},"process_trusted":"TRUSTED"}}},"xRequestSig":""}`,
+-		c.SID, appID, destAddr, c.DeviceID, c.ConnectionID, procHash, c.Username, destAddr, procName, procHash, procPath,
++		`{"sid":"%s","appId":"%s","url":"tcp://%s","deviceId":"%s","connectionId":"%s","procHash":"%s","userName":"%s","rcAppliedInfo":0,"lang":"zh-CN","destAddr":"%s","env":{"application":{"runtime":{"process":{"name":"%s","digital_signature":"TrustAppClosed","platform":"%s","fingerprint":"%s","description":"TrustAppClosed","path":"%s","version":"TrustAppClosed","security_env":"normal"},"process_trusted":"TRUSTED"}}},"xRequestSig":""}`,
++		c.SID, appID, destAddr, c.DeviceID, c.ConnectionID, procHash, c.Username, destAddr, procName, platform, procHash, procPath,
+ 	)
+ 	signKeyBytes, err := hex.DecodeString(c.SignKey)
+ 	if err != nil {
+@@ -246,6 +306,7 @@ func (c *Client) DialTCP(ctx context.Context, addr *net.TCPAddr) (net.Conn, erro
+ 		_ = conn.Close()
+ 		return nil, fmt.Errorf("failed to send init message: %w", err)
+ 	}
++	log.Printf("aTrust TCP tunnel: initialization frame sent, target=%s", destAddr)
+ 	log.DebugDumpHex(initMsg)
+ 
+ 	var destMsg []byte
+@@ -268,10 +329,18 @@ func (c *Client) DialTCP(ctx context.Context, addr *net.TCPAddr) (net.Conn, erro
+ 		_ = conn.Close()
+ 		return nil, fmt.Errorf("failed to send dest address: %w", err)
+ 	}
++	log.Printf("aTrust TCP tunnel: destination frame sent, target=%s", destAddr)
++
++	reader := bufio.NewReader(conn)
++	if err := negotiateQuickSocks5(conn, reader); err != nil {
++		_ = conn.Close()
++		return nil, err
++	}
+ 	log.DebugDumpHex(destMsg)
+ 
+ 	return &tcpTunnelConn{
+ 		tlsConn: conn,
+-		reader:  bufio.NewReader(conn),
++		reader:  reader,
++		quick:   true,
+ 	}, nil
+ }

@@ -1,4 +1,6 @@
-use super::{atrust, fortinet, VpnManager, VpnStatus};
+#[cfg(not(target_os = "windows"))]
+use super::{atrust, fortinet};
+use super::{VpnManager, VpnStatus};
 use tauri::{AppHandle, Emitter};
 
 /** 安全退出清理状态，供前端显示失败原因。 */
@@ -20,8 +22,31 @@ async fn process_exists(process_name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/** 非 macOS 当前没有受支持的 sidecar，不执行 Unix 进程探测。 */
-#[cfg(not(target_os = "macos"))]
+/** 使用 tasklist 复核 Windows 本机是否仍有指定 VPN 引擎。 */
+#[cfg(target_os = "windows")]
+async fn process_exists(process_name: &str) -> bool {
+    let image_name = format!("{process_name}.exe");
+    tokio::process::Command::new("tasklist.exe")
+        .args([
+            "/FI",
+            &format!("IMAGENAME eq {image_name}"),
+            "/FO",
+            "CSV",
+            "/NH",
+        ])
+        .output()
+        .await
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .to_ascii_lowercase()
+                    .contains(&image_name.to_ascii_lowercase())
+        })
+        .unwrap_or(false)
+}
+
+/** 其他未支持平台不执行进程探测。 */
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 async fn process_exists(_process_name: &str) -> bool {
     false
 }
@@ -121,44 +146,61 @@ async fn cleanup_local_resources(manager: &VpnManager) {
  */
 pub async fn shutdown_all_vpns(app_handle: &AppHandle, manager: &VpnManager) -> Result<(), String> {
     manager.begin_shutdown();
-    let has_sudo_credentials = manager.inner.lock().await.sudo_password.is_some();
 
-    if has_sudo_credentials {
-        let (fortinet_result, atrust_result) = tokio::join!(
-            fortinet::disconnect_fortinet_managed(app_handle, manager),
-            atrust::disconnect_atrust_managed(app_handle, manager)
+    #[cfg(target_os = "windows")]
+    {
+        super::windows::shutdown_helper(app_handle, manager).await?;
+        let _ = app_handle.emit(
+            "app-exit-cleanup-status",
+            ShutdownStatusPayload {
+                success: true,
+                message: "本 App 托管的 Windows VPN 进程、Wintun 与分流路由已清理".to_string(),
+            },
         );
-        let mut errors = Vec::new();
-        if let Err(error) = fortinet_result {
-            errors.push(format!("Fortinet 清理失败：{error}"));
-        }
-        if let Err(error) = atrust_result {
-            errors.push(format!("aTrust 清理失败：{error}"));
-        }
-        if !errors.is_empty() {
-            let message = errors.join("；");
-            let _ = app_handle.emit(
-                "app-exit-cleanup-status",
-                ShutdownStatusPayload {
-                    success: false,
-                    message: message.clone(),
-                },
-            );
-            return Err(message);
-        }
-    } else {
-        cleanup_local_resources(manager).await;
+        Ok(())
     }
 
-    wait_for_sidecars_to_exit().await?;
-    let _ = app_handle.emit(
-        "app-exit-cleanup-status",
-        ShutdownStatusPayload {
-            success: true,
-            message: "VPN 进程与临时网络资源已清理".to_string(),
-        },
-    );
-    Ok(())
+    #[cfg(not(target_os = "windows"))]
+    {
+        let has_sudo_credentials = manager.inner.lock().await.sudo_password.is_some();
+
+        if has_sudo_credentials {
+            let (fortinet_result, atrust_result) = tokio::join!(
+                fortinet::disconnect_fortinet_managed(app_handle, manager),
+                atrust::disconnect_atrust_managed(app_handle, manager)
+            );
+            let mut errors = Vec::new();
+            if let Err(error) = fortinet_result {
+                errors.push(format!("Fortinet 清理失败：{error}"));
+            }
+            if let Err(error) = atrust_result {
+                errors.push(format!("aTrust 清理失败：{error}"));
+            }
+            if !errors.is_empty() {
+                let message = errors.join("；");
+                let _ = app_handle.emit(
+                    "app-exit-cleanup-status",
+                    ShutdownStatusPayload {
+                        success: false,
+                        message: message.clone(),
+                    },
+                );
+                return Err(message);
+            }
+        } else {
+            cleanup_local_resources(manager).await;
+        }
+
+        wait_for_sidecars_to_exit().await?;
+        let _ = app_handle.emit(
+            "app-exit-cleanup-status",
+            ShutdownStatusPayload {
+                success: true,
+                message: "VPN 进程与临时网络资源已清理".to_string(),
+            },
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]

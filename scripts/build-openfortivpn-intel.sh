@@ -92,6 +92,10 @@ clone_openfortivpn
 test "$(git -C "$OPENFORTIVPN_SOURCE_DIRECTORY" rev-parse HEAD)" = "$OPENFORTIVPN_COMMIT"
 git -C "$OPENFORTIVPN_SOURCE_DIRECTORY" apply --check "$REPOSITORY_ROOT/scripts/patches/openfortivpn-1.24.1-http-status.patch"
 git -C "$OPENFORTIVPN_SOURCE_DIRECTORY" apply "$REPOSITORY_ROOT/scripts/patches/openfortivpn-1.24.1-http-status.patch"
+# 老式 FortiOS 门户返回 /remote/fortisslvpn_xml 404 时回退到 /remote/fortisslvpn 的 text6 分流路由，
+# 与 ARM 冻结的 1.18.0 原生行为、Windows 候选补丁保持一致，仅修改 x86_64 构建。
+git -C "$OPENFORTIVPN_SOURCE_DIRECTORY" apply --check "$REPOSITORY_ROOT/scripts/patches/openfortivpn-1.24.1-legacy-config.patch"
+git -C "$OPENFORTIVPN_SOURCE_DIRECTORY" apply "$REPOSITORY_ROOT/scripts/patches/openfortivpn-1.24.1-legacy-config.patch"
 
 cd "$OPENFORTIVPN_SOURCE_DIRECTORY"
 run_logged openfortivpn-autogen ./autogen.sh
@@ -105,6 +109,7 @@ run_logged openfortivpn-build make -s -j"$(sysctl -n hw.logicalcpu)"
 file openfortivpn | grep -q 'x86_64'
 test "$(./openfortivpn --version)" = "$OPENFORTIVPN_VERSION"
 grep -a -q 'stage: fortisslvpn_xml' openfortivpn
+grep -a -q 'Legacy FortiOS VPN configuration accepted' openfortivpn
 xcrun vtool -show-build openfortivpn | grep -q 'minos 12.0'
 if otool -L openfortivpn | grep -Eq '/(usr/local|opt/homebrew|Cellar|openfortivpn-intel)/'; then
   echo "Intel openfortivpn 仍依赖 Homebrew 动态库，禁止进入安装包" >&2

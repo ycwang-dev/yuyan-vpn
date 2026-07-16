@@ -9,6 +9,12 @@ use tauri::{Emitter, Manager};
 mod app_update;
 mod vpn;
 
+/** Windows 主程序在创建 WebView 前尝试进入无界面的 UAC helper 模式。 */
+#[cfg(target_os = "windows")]
+pub fn run_windows_vpn_helper_if_requested() -> bool {
+    vpn::windows::run_helper_if_requested()
+}
+
 /** 暗色主题下的 App Dock 图标字节（已更新为全新的 C4D 液态玻璃图标且优化尺寸边距） */
 const DARK_ICON: &[u8] = include_bytes!("../resources/yuyan_dark_clean.png");
 /** 亮色主题下的 App Dock 图标字节（已更新为全新的 C4D 液态玻璃图标且优化尺寸边距） */
@@ -248,12 +254,12 @@ pub fn run() {
             vpn::fortinet::disconnect_fortinet,
             vpn::submit_vpn_mfa
         ])
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|_window, event| {
+            if let tauri::WindowEvent::CloseRequested { api: _api, .. } = event {
                 #[cfg(target_os = "macos")]
                 {
-                    api.prevent_close();
-                    let _ = window.hide();
+                    _api.prevent_close();
+                    let _ = _window.hide();
                 }
             }
         })
@@ -265,14 +271,14 @@ pub fn run() {
                 let _ = app_handle.emit("menu-about", ());
             }
         })
-        .setup(move |app| {
+        .setup(move |_app| {
             #[cfg(target_os = "macos")]
             tauri::async_runtime::spawn(vpn::maintain_idle_network_state(network_recovery_manager));
 
             #[cfg(target_os = "macos")]
             {
                 use tauri::menu::{Menu, MenuItemBuilder};
-                let app_handle = app.handle();
+                let app_handle = _app.handle();
                 if let Ok(menu) = Menu::default(app_handle) {
                     if let Ok(items) = menu.items() {
                         if let Some(first_item) = items.first() {
@@ -294,7 +300,7 @@ pub fn run() {
                             }
                         }
                     }
-                    let _ = app.set_menu(menu);
+                    let _ = _app.set_menu(menu);
                 }
             }
 
