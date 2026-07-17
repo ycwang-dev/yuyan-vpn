@@ -1,6 +1,6 @@
 {
   "name": "yuyan-vpn",
-  "version": "1.0.14",
+  "version": "1.0.15",
   "private": true,
   "type": "module",
   "description": "雨燕 SwiftVPN 桌面端 - VPN 分流连接工具",
