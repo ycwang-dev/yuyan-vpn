@@ -6,8 +6,8 @@ import { useTheme } from '@/hooks/useTheme';
 import { useNavigation } from './hooks/useNavigation';
 import { useSafeExitNotice } from './hooks/useSafeExitNotice';
 import SettingsDrawer from '@/components/SettingsDrawer/index.vue';
-import LayoutHeader from './components/LayoutHeader.vue';
-import LayoutSider from './components/LayoutSider.vue';
+import LayoutHeader from './components/LayoutHeader/index.vue';
+import LayoutSider from './components/LayoutSider/index.vue';
 import AboutModal from '@/components/AboutModal/index.vue';
 
 defineOptions({ name: 'BasicLayout' });

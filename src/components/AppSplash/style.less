@@ -1,0 +1,452 @@
+.swift-splash {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  overflow: hidden;
+  contain: strict;
+  isolation: isolate;
+  color: #f1fdff;
+  background:
+    radial-gradient(circle at 50% 50%, rgba(45, 153, 208, 0.2) 0, transparent 32%),
+    linear-gradient(135deg, #090b2b 0%, #07152d 52%, #062b3a 100%);
+  font-family: Bahnschrift, 'Avenir Next', 'Segoe UI Variable Display', sans-serif;
+}
+
+.ambient {
+  position: absolute;
+  width: 48vw;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  opacity: 0.2;
+  transform: translateZ(0);
+}
+
+.ambient--violet {
+  top: -32%;
+  left: -20%;
+  background: radial-gradient(circle, #7a50ff 0, transparent 68%);
+}
+
+.ambient--cyan {
+  right: -22%;
+  bottom: -35%;
+  background: radial-gradient(circle, #2ae8d5 0, transparent 68%);
+}
+
+.star-field {
+  position: absolute;
+  inset: 0;
+  opacity: 0.28;
+  background-image: radial-gradient(circle, rgba(191, 248, 255, 0.8) 0 1px, transparent 1.3px);
+  background-size: 92px 92px;
+}
+
+.orbit {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  border: 1px solid rgba(147, 228, 244, 0.08);
+  border-radius: 50%;
+  transform: translate3d(-50%, -50%, 0) rotate(-12deg);
+}
+
+.orbit--one {
+  width: 52vw;
+  height: 31vw;
+}
+
+.orbit--two {
+  width: 82vw;
+  height: 50vw;
+  border-style: dashed;
+}
+
+.bird-definitions {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+
+.flight-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.flying-bird {
+  position: absolute;
+  width: 110px;
+  height: 110px;
+  opacity: 0;
+  backface-visibility: hidden;
+  transform: translate3d(0, 0, 0);
+  will-change: transform, opacity;
+  perspective: 400px; /* 激活 3D 空间透视 */
+}
+
+.flying-bird .bird-image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  filter: drop-shadow(0 2px 8px rgba(102, 222, 255, 0.4));
+  transform-origin: center center;
+  /* 翅膀动作更真实：220ms 非对称生物级扇翅循环 */
+  animation: flap 0.22s cubic-bezier(0.25, 0.8, 0.25, 1) infinite;
+}
+
+.speed-line {
+  position: absolute;
+  top: 50%;
+  right: 74%;
+  width: 112%;
+  height: 1px;
+  opacity: 0.48;
+  background: linear-gradient(90deg, transparent, rgba(99, 225, 255, 0.58));
+  transform: translateZ(0);
+}
+
+.flying-bird--1 {
+  animation: fly-one 1.68s 0.04s cubic-bezier(0.2, 0.72, 0.18, 1) both;
+}
+
+.flying-bird--2 {
+  animation: fly-two 1.62s 0.22s cubic-bezier(0.2, 0.72, 0.18, 1) both;
+}
+
+.flying-bird--hero {
+  z-index: 3;
+  width: 180px;
+  height: 180px;
+  animation: fly-hero 2.08s 0.02s cubic-bezier(0.18, 0.78, 0.16, 1) both;
+}
+
+.flying-bird--hero .bird-image {
+  filter: drop-shadow(0 4px 16px rgba(102, 222, 255, 0.6));
+}
+
+.brand-stage {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: clamp(30px, 4vw, 58px);
+  opacity: 0;
+  backface-visibility: hidden;
+  transform: translate3d(-50%, -46%, 0) scale(0.9);
+  animation: brand-in 0.52s 1.52s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+  will-change: transform, opacity;
+}
+
+.icon-shell {
+  position: relative;
+  width: clamp(150px, 18vw, 218px);
+  aspect-ratio: 1;
+  flex: 0 0 auto;
+  padding: 2px;
+  border-radius: 27%;
+  background: linear-gradient(
+    145deg,
+    rgba(247, 255, 255, 0.88),
+    rgba(102, 222, 255, 0.18) 38%,
+    rgba(116, 74, 239, 0.78) 100%
+  );
+  box-shadow:
+    0 24px 52px rgba(0, 0, 0, 0.4),
+    0 0 30px rgba(81, 210, 255, 0.16),
+    0 0 0 1px rgba(179, 236, 255, 0.08);
+  transform: translateZ(0);
+}
+
+.icon-shell::after {
+  position: absolute;
+  right: 13%;
+  bottom: -9%;
+  left: 13%;
+  height: 15%;
+  border-radius: 50%;
+  background: rgba(70, 113, 255, 0.3);
+  content: '';
+  opacity: 0.34;
+  transform: scaleY(0.36);
+}
+
+.icon-surface {
+  position: relative;
+  display: grid;
+  width: 100%;
+  height: 100%;
+  place-items: center;
+  overflow: hidden;
+  border-radius: calc(27% - 2px);
+  background:
+    radial-gradient(circle at 32% 24%, rgba(98, 120, 232, 0.66) 0, transparent 36%),
+    radial-gradient(circle at 72% 78%, rgba(63, 28, 130, 0.38) 0, transparent 42%),
+    linear-gradient(145deg, #222c70 0%, #101537 48%, #07091c 100%);
+  box-shadow:
+    inset 0 1px 1px rgba(255, 255, 255, 0.34),
+    inset 0 -18px 32px rgba(0, 0, 0, 0.32);
+}
+
+.icon-surface::before {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(132deg, rgba(255, 255, 255, 0.16), transparent 30%),
+    radial-gradient(circle at 22% 19%, rgba(224, 253, 255, 0.24) 0 1px, transparent 1.5px);
+  background-size: auto, 34px 34px;
+  content: '';
+}
+
+.icon-surface::after {
+  position: absolute;
+  inset: 8px;
+  border: 1px solid rgba(195, 244, 255, 0.08);
+  border-radius: calc(27% - 7px);
+  content: '';
+}
+
+.icon-surface .brand-logo-image {
+  position: relative;
+  z-index: 1;
+  width: 82%;
+  height: 82%;
+  object-fit: contain;
+  filter: drop-shadow(0 4px 12px rgba(102, 222, 255, 0.5));
+  transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  .icon-shell:hover & {
+    transform: scale(1.1) rotate(4deg);
+  }
+}
+
+.brand-copy {
+  min-width: max-content;
+  text-align: left;
+}
+
+.eyebrow,
+.tagline {
+  margin: 0;
+  color: rgba(187, 235, 244, 0.56);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.32em;
+}
+
+.brand-copy h1 {
+  margin: 7px 0 -1px;
+  color: #f5feff;
+  font-size: clamp(45px, 7vw, 84px);
+  font-weight: 760;
+  line-height: 0.96;
+  letter-spacing: 0.11em;
+  text-shadow: 0 8px 30px rgba(36, 210, 255, 0.16);
+}
+
+.platform {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  color: rgba(220, 250, 255, 0.85);
+  font-size: clamp(11px, 1.4vw, 15px);
+  font-weight: 600;
+  letter-spacing: 0.62em;
+}
+
+.platform span {
+  width: 28px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, #66eaff);
+}
+
+.platform span:last-child {
+  transform: scaleX(-1);
+}
+
+.tagline {
+  margin-top: 18px;
+  color: rgba(187, 224, 231, 0.43);
+  letter-spacing: 0.4em;
+}
+
+.skip-button {
+  position: absolute;
+  right: 26px;
+  bottom: 23px;
+  z-index: 7;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border: 0;
+  color: rgba(220, 249, 255, 0.42);
+  background: transparent;
+  font: 600 10px/1 inherit;
+  letter-spacing: 0.24em;
+  cursor: pointer;
+  opacity: 0;
+  animation: skip-in 0.28s 0.45s forwards;
+}
+
+.skip-button span {
+  width: 24px;
+  height: 1px;
+  background: currentColor;
+  transition: width 0.2s ease;
+}
+
+.skip-button:hover,
+.skip-button:focus-visible {
+  color: #f1ffff;
+  outline: none;
+}
+
+.skip-button:hover span,
+.skip-button:focus-visible span {
+  width: 36px;
+}
+
+.splash-fade-leave-active {
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+.splash-fade-leave-to {
+  opacity: 0;
+  transform: scale(1.008);
+}
+
+@keyframes fly-one {
+  0% {
+    opacity: 0;
+    transform: translate3d(108vw, 42vh, 0) scale(0.05) rotate(-3deg);
+  }
+  18% {
+    opacity: 0.85;
+  }
+  75% {
+    opacity: 1;
+    transform: translate3d(48vw, 22vh, 0) scale(0.85) rotate(-6deg);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(-20vw, 2vh, 0) scale(2.0) rotate(-11deg);
+  }
+}
+
+@keyframes fly-two {
+  0% {
+    opacity: 0;
+    transform: translate3d(120vw, 85vh, 0) scale(0.04) rotate(-5deg);
+  }
+  22% {
+    opacity: 0.8;
+  }
+  75% {
+    opacity: 1;
+    transform: translate3d(52vw, 50vh, 0) scale(0.7) rotate(-9deg);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(-15vw, 25vh, 0) scale(1.6) rotate(-15deg);
+  }
+}
+
+@keyframes fly-hero {
+  0% {
+    opacity: 0;
+    transform: translate3d(115vw, 65vh, 0) scale(0.06) rotate(-4deg);
+  }
+  15% {
+    opacity: 0.9;
+  }
+  75% {
+    opacity: 1;
+    transform: translate3d(45vw, 36vh, 0) scale(1.1) rotate(-8deg);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(-30vw, 12vh, 0) scale(3.2) rotate(-14deg);
+  }
+}
+
+@keyframes brand-in {
+  0% {
+    opacity: 0;
+    transform: translate3d(-50%, -46%, 0) scale(0.9);
+  }
+  70% {
+    opacity: 1;
+    transform: translate3d(-50%, -50%, 0) scale(1.018);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(-50%, -50%, 0) scale(1);
+  }
+}
+
+@keyframes skip-in {
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes flap {
+  0% {
+    /* 展翅迎风：翅膀拉平微开，略微后掠 */
+    transform: scaleX(-1) rotateX(-12deg) rotateY(-3deg) skewY(-2deg) scaleY(1.04);
+  }
+  32% {
+    /* 强力向下拍击：翅膀朝下弯折，高度拉伸，倾角变陡 */
+    transform: scaleX(-1) rotateX(24deg) rotateY(2deg) skewY(1deg) scaleY(0.96) translateY(-2px);
+  }
+  68% {
+    /* 拍击最底点，准备收折：翅膀向上快速折回，迎风面迅速收窄，高度变矮 */
+    transform: scaleX(-1) rotateX(54deg) rotateY(6deg) skewY(4deg) scaleY(0.64) translateY(-4px);
+  }
+  100% {
+    /* 复位：返回迎风展翅姿态 */
+    transform: scaleX(-1) rotateX(-12deg) rotateY(-3deg) skewY(-2deg) scaleY(1.04);
+  }
+}
+
+@media (max-width: 760px) {
+  .brand-stage {
+    flex-direction: column;
+    gap: 24px;
+  }
+
+  .brand-copy {
+    text-align: center;
+  }
+
+  .platform {
+    justify-content: center;
+  }
+
+  .eyebrow {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .flight-layer {
+    display: none;
+  }
+
+  .swift-splash *,
+  .swift-splash *::before,
+  .swift-splash *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+  }
+
+  .brand-stage {
+    opacity: 1;
+    transform: translate3d(-50%, -50%, 0);
+  }
+}
