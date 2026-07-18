@@ -585,7 +585,34 @@ where
     }
 }
 
-/** 等待本次新建的 PPP 接口，安装路由后才把连接标记为可用。 */
+/** 等待本次 openfortivpn 创建或重建 PPP 接口并取得有效 IPv4。 */
+async fn wait_for_ppp_readiness(
+    existing_ppp_interfaces: &HashSet<String>,
+    manager: &Arc<Mutex<VpnManagerInner>>,
+) -> Option<(String, String)> {
+    loop {
+        let status = manager.lock().await.fortinet_status;
+        if matches!(
+            status,
+            VpnStatus::Disconnected | VpnStatus::Disconnecting | VpnStatus::Error
+        ) {
+            return None;
+        }
+
+        let current = list_ppp_interfaces().await;
+        for interface_name in current.difference(existing_ppp_interfaces) {
+            if let Some(assigned_ip) = interface_ipv4(interface_name)
+                .await
+                .filter(|ip| ip != "0.0.0.0")
+            {
+                return Some((interface_name.clone(), assigned_ip));
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+}
+
+/** 等待本次新建的 PPP 接口，安装路由，并在隧道重建后重复恢复分流状态。 */
 async fn maintain_split_network(
     sudo_password: String,
     existing_ppp_interfaces: HashSet<String>,
@@ -595,183 +622,188 @@ async fn maintain_split_network(
     manager: Arc<Mutex<VpnManagerInner>>,
     app_handle: AppHandle,
 ) {
-    let readiness = tokio::time::timeout(std::time::Duration::from_secs(75), async {
-        let interface_name = loop {
-            let status = manager.lock().await.fortinet_status;
-            if matches!(
-                status,
-                VpnStatus::Disconnected | VpnStatus::Disconnecting | VpnStatus::Error
-            ) {
-                return None;
-            }
+    let mut has_connected = false;
 
-            let current = list_ppp_interfaces().await;
-            if let Some(interface) = current.difference(&existing_ppp_interfaces).next().cloned() {
-                break interface;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        };
+    loop {
+        let readiness = tokio::time::timeout(
+            std::time::Duration::from_secs(75),
+            wait_for_ppp_readiness(&existing_ppp_interfaces, &manager),
+        )
+        .await;
 
-        let assigned_ip = loop {
-            let status = manager.lock().await.fortinet_status;
-            if matches!(
-                status,
-                VpnStatus::Disconnected | VpnStatus::Disconnecting | VpnStatus::Error
-            ) {
-                return None;
-            }
+        let (interface_name, assigned_ip) = match readiness {
+            Ok(Some(readiness)) => readiness,
+            Ok(None) => return,
+            Err(_) => {
+                let (process_id, gateway_target, mihomo_state) = {
+                    let mut inner = manager.lock().await;
+                    if inner.fortinet_status != VpnStatus::Connecting {
+                        return;
+                    }
+                    inner.fortinet_status = VpnStatus::Error;
+                    inner.fortinet_ip = None;
+                    inner.fortinet_start_time = None;
+                    (
+                        inner.fortinet_child.as_ref().and_then(|child| child.id()),
+                        inner.fortinet_gateway_host.take(),
+                        inner.fortinet_mihomo_state.take(),
+                    )
+                };
 
-            if let Some(ip) = interface_ipv4(&interface_name)
-                .await
-                .filter(|ip| ip != "0.0.0.0")
-            {
-                break ip;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        };
-
-        Some((interface_name, assigned_ip))
-    })
-    .await;
-
-    let (interface_name, assigned_ip) = match readiness {
-        Ok(Some(readiness)) => readiness,
-        Ok(None) => return,
-        Err(_) => {
-            let (process_id, gateway_target, mihomo_state) = {
-                let mut inner = manager.lock().await;
-                if inner.fortinet_status != VpnStatus::Connecting {
-                    return;
+                let error = if has_connected {
+                    "北京服务器 VPN 隧道中断后在 75 秒内未恢复，已终止连接并恢复公网"
+                } else {
+                    "北京服务器 VPN 在 75 秒内未建立 PPP 通道，已终止连接并恢复公网"
+                };
+                emit_vpn_log(&app_handle, VpnType::Fortinet, error);
+                emit_status(&app_handle, VpnStatus::Error, error, None);
+                if let Some(process_id) = process_id {
+                    terminate_managed_process_group(&sudo_password, process_id).await;
+                } else {
+                    let _ = run_sudo_command(&sudo_password, "killall", &["openfortivpn"]).await;
                 }
+                if let Some(gateway_target) = gateway_target {
+                    remove_gateway_route(&sudo_password, &gateway_target).await;
+                }
+                restore_mihomo_interface(mihomo_state).await;
+                return;
+            }
+        };
+
+        if let Err(error) =
+            repair_primary_network(&sudo_password, &interface_name, &primary_network).await
+        {
+            let process_id = {
+                let mut inner = manager.lock().await;
                 inner.fortinet_status = VpnStatus::Error;
                 inner.fortinet_ip = None;
                 inner.fortinet_start_time = None;
-                (
-                    inner.fortinet_child.as_ref().and_then(|child| child.id()),
-                    inner.fortinet_gateway_host.take(),
-                    inner.fortinet_mihomo_state.take(),
-                )
+                inner.fortinet_child.as_ref().and_then(|child| child.id())
             };
-
-            let error = "北京服务器 VPN 在 75 秒内未建立 PPP 通道，已终止连接并恢复公网";
-            emit_vpn_log(&app_handle, VpnType::Fortinet, error);
-            emit_status(&app_handle, VpnStatus::Error, error, None);
             if let Some(process_id) = process_id {
                 terminate_managed_process_group(&sudo_password, process_id).await;
             } else {
                 let _ = run_sudo_command(&sudo_password, "killall", &["openfortivpn"]).await;
             }
-            if let Some(gateway_target) = gateway_target {
-                remove_gateway_route(&sudo_password, &gateway_target).await;
-            }
-            restore_mihomo_interface(mihomo_state).await;
+            emit_vpn_log(&app_handle, VpnType::Fortinet, error.clone());
+            emit_status(&app_handle, VpnStatus::Error, error, None);
             return;
-        }
-    };
-
-    if let Err(error) =
-        repair_primary_network(&sudo_password, &interface_name, &primary_network).await
-    {
-        {
-            let mut inner = manager.lock().await;
-            inner.fortinet_status = VpnStatus::Error;
-            inner.fortinet_ip = None;
-            inner.fortinet_start_time = None;
-        }
-        emit_vpn_log(&app_handle, VpnType::Fortinet, error.clone());
-        emit_status(&app_handle, VpnStatus::Error, error, None);
-        let _ = run_sudo_command(&sudo_password, "killall", &["openfortivpn"]).await;
-        return;
-    }
-
-    if let Err(error) = install_split_routes(&sudo_password, &custom_routes, &interface_name).await
-    {
-        {
-            let mut inner = manager.lock().await;
-            inner.fortinet_status = VpnStatus::Error;
-            inner.fortinet_ip = None;
-            inner.fortinet_start_time = None;
-        }
-        emit_vpn_log(&app_handle, VpnType::Fortinet, error.clone());
-        emit_status(&app_handle, VpnStatus::Error, error, None);
-        let _ = run_sudo_command(&sudo_password, "killall", &["openfortivpn"]).await;
-        return;
-    }
-
-    {
-        let mut inner = manager.lock().await;
-        inner.fortinet_ip = Some(assigned_ip.clone());
-        inner.fortinet_status = VpnStatus::Connected;
-    }
-    emit_status(
-        &app_handle,
-        VpnStatus::Connected,
-        "北京服务器 VPN 已连接，内网路由已就绪",
-        Some(assigned_ip),
-    );
-
-    while interface_exists(&interface_name).await {
-        let status = manager.lock().await.fortinet_status;
-        if matches!(status, VpnStatus::Disconnected | VpnStatus::Disconnecting) {
-            return;
-        }
-        if let Ok(current_network) = get_primary_network_state().await {
-            if is_physical_interface(&current_network.interface)
-                && current_network != primary_network
-            {
-                emit_vpn_log(
-                    &app_handle,
-                    VpnType::Fortinet,
-                    format!(
-                        "检测到公网出口切换：{} ({}) -> {} ({})",
-                        primary_network.interface,
-                        primary_network.router,
-                        current_network.interface,
-                        current_network.router
-                    ),
-                );
-                primary_network = current_network;
-                if let Err(error) = follow_mihomo_interface(&primary_network.interface).await {
-                    emit_vpn_log(&app_handle, VpnType::Fortinet, error);
-                }
-            }
-        }
-
-        match ensure_gateway_route(&sudo_password, &gateway_host, &primary_network).await {
-            Ok(GatewayRouteOutcome::Added(route_target)) => {
-                manager.lock().await.fortinet_gateway_host = Some(route_target);
-            }
-            Ok(GatewayRouteOutcome::Unchanged | GatewayRouteOutcome::ProxyManaged) => {}
-            Err(error) => emit_vpn_log(&app_handle, VpnType::Fortinet, error),
         }
 
         if let Err(error) =
-            repair_primary_network(&sudo_password, &interface_name, &primary_network).await
+            install_split_routes(&sudo_password, &custom_routes, &interface_name).await
         {
-            emit_vpn_log(&app_handle, VpnType::Fortinet, error);
-        }
-        for route in &custom_routes {
-            if !route_uses_interface(route, &interface_name).await {
-                if let Err(error) =
-                    install_split_routes(&sudo_password, &[route.clone()], &interface_name).await
-                {
-                    emit_vpn_log(&app_handle, VpnType::Fortinet, error);
-                }
+            let process_id = {
+                let mut inner = manager.lock().await;
+                inner.fortinet_status = VpnStatus::Error;
+                inner.fortinet_ip = None;
+                inner.fortinet_start_time = None;
+                inner.fortinet_child.as_ref().and_then(|child| child.id())
+            };
+            if let Some(process_id) = process_id {
+                terminate_managed_process_group(&sudo_password, process_id).await;
+            } else {
+                let _ = run_sudo_command(&sudo_password, "killall", &["openfortivpn"]).await;
             }
+            emit_vpn_log(&app_handle, VpnType::Fortinet, error.clone());
+            emit_status(&app_handle, VpnStatus::Error, error, None);
+            return;
         }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
 
-    let mut inner = manager.lock().await;
-    if inner.fortinet_status == VpnStatus::Connected {
-        inner.fortinet_status = VpnStatus::Error;
-        inner.fortinet_ip = None;
-        inner.fortinet_start_time = None;
-        drop(inner);
+        {
+            let mut inner = manager.lock().await;
+            inner.fortinet_ip = Some(assigned_ip.clone());
+            inner.fortinet_status = VpnStatus::Connected;
+        }
+        let connected_message = if has_connected {
+            "北京服务器 VPN 已自动重连，内网路由已恢复"
+        } else {
+            "北京服务器 VPN 已连接，内网路由已就绪"
+        };
         emit_status(
             &app_handle,
-            VpnStatus::Error,
-            "北京服务器 VPN 隧道已断开",
+            VpnStatus::Connected,
+            connected_message,
+            Some(assigned_ip),
+        );
+        has_connected = true;
+
+        while interface_exists(&interface_name).await {
+            let status = manager.lock().await.fortinet_status;
+            if matches!(
+                status,
+                VpnStatus::Disconnected | VpnStatus::Disconnecting | VpnStatus::Error
+            ) {
+                return;
+            }
+            if let Ok(current_network) = get_primary_network_state().await {
+                if is_physical_interface(&current_network.interface)
+                    && current_network != primary_network
+                {
+                    emit_vpn_log(
+                        &app_handle,
+                        VpnType::Fortinet,
+                        format!(
+                            "检测到公网出口切换：{} ({}) -> {} ({})",
+                            primary_network.interface,
+                            primary_network.router,
+                            current_network.interface,
+                            current_network.router
+                        ),
+                    );
+                    primary_network = current_network;
+                    if let Err(error) = follow_mihomo_interface(&primary_network.interface).await {
+                        emit_vpn_log(&app_handle, VpnType::Fortinet, error);
+                    }
+                }
+            }
+
+            match ensure_gateway_route(&sudo_password, &gateway_host, &primary_network).await {
+                Ok(GatewayRouteOutcome::Added(route_target)) => {
+                    manager.lock().await.fortinet_gateway_host = Some(route_target);
+                }
+                Ok(GatewayRouteOutcome::Unchanged | GatewayRouteOutcome::ProxyManaged) => {}
+                Err(error) => emit_vpn_log(&app_handle, VpnType::Fortinet, error),
+            }
+
+            if let Err(error) =
+                repair_primary_network(&sudo_password, &interface_name, &primary_network).await
+            {
+                emit_vpn_log(&app_handle, VpnType::Fortinet, error);
+            }
+            for route in &custom_routes {
+                if !route_uses_interface(route, &interface_name).await {
+                    if let Err(error) = install_split_routes(
+                        &sudo_password,
+                        std::slice::from_ref(route),
+                        &interface_name,
+                    )
+                    .await
+                    {
+                        emit_vpn_log(&app_handle, VpnType::Fortinet, error);
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+
+        {
+            let mut inner = manager.lock().await;
+            if inner.fortinet_status != VpnStatus::Connected {
+                return;
+            }
+            inner.fortinet_status = VpnStatus::Connecting;
+            inner.fortinet_ip = None;
+        }
+        emit_vpn_log(
+            &app_handle,
+            VpnType::Fortinet,
+            "检测到 PPP 隧道中断，正在自动重连并等待恢复分流路由",
+        );
+        emit_status(
+            &app_handle,
+            VpnStatus::Connecting,
+            "北京服务器 VPN 隧道中断，正在自动重连",
             None,
         );
     }
@@ -943,6 +975,7 @@ pub async fn connect_fortinet(
             .arg("--no-routes")
             .arg("--no-dns")
             .arg("--pppd-no-peerdns")
+            .arg("--persistent=3")
             .arg("--min-tls=1.0")
             .arg("--cipher-list=DHE-RSA-AES256-SHA:@SECLEVEL=0")
             .arg("-v")

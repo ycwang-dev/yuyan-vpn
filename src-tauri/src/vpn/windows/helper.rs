@@ -390,8 +390,13 @@ async fn execute_command(
     job: &Arc<JobHandle>,
 ) -> (HelperResponse, bool) {
     refresh_exited_children(state).await;
+    let after_sequence = match &command {
+        HelperCommand::Snapshot { after_sequence } => *after_sequence,
+        HelperCommand::Ping => u64::MAX,
+        _ => 0,
+    };
     let result = match command {
-        HelperCommand::Ping | HelperCommand::Snapshot => Ok(false),
+        HelperCommand::Ping | HelperCommand::Snapshot { .. } => Ok(false),
         HelperCommand::ConnectFortinet { config, password } => {
             let previous_status = state.lock().await.fortinet.status;
             match connect_fortinet(state, job, config, password).await {
@@ -441,7 +446,7 @@ async fn execute_command(
 
     let guard = state.lock().await;
     let snapshot = guard.snapshot();
-    let logs = guard.logs_after(0);
+    let logs = guard.logs_after(after_sequence);
     match result {
         Ok(should_stop) => (HelperResponse::success(snapshot, logs), should_stop),
         Err(error) => (HelperResponse::failure(error, snapshot), false),
@@ -494,6 +499,7 @@ async fn connect_fortinet(
         .arg(format!("--trusted-cert={FORTINET_TRUSTED_CERT}"))
         .arg("--no-routes")
         .arg("--no-dns")
+        .arg("--persistent=3")
         .arg("--min-tls=1.0")
         .arg("--cipher-list=DHE-RSA-AES256-SHA:@SECLEVEL=0")
         .arg("-v")
@@ -751,10 +757,24 @@ async fn handle_fortinet_log(text: &str, state: &Arc<Mutex<HelperState>>) {
             state.lock().await.fortinet.status = VpnStatus::Error;
             schedule_error_cleanup(state.clone(), VpnType::Fortinet).await;
         }
+        Some("transport_down") => {
+            if let Some(reason) = event.get("reason").and_then(serde_json::Value::as_str) {
+                state.lock().await.push_log(
+                    VpnType::Fortinet,
+                    format!("Fortinet 传输层停止原因: {reason}"),
+                );
+            }
+        }
         Some("tunnel_down") => {
             let (routes, gateway) = {
                 let mut guard = state.lock().await;
-                guard.fortinet.status = VpnStatus::Disconnected;
+                let will_reconnect =
+                    guard.fortinet.child.is_some() && !guard.fortinet.cleanup_scheduled;
+                guard.fortinet.status = if will_reconnect {
+                    VpnStatus::Connecting
+                } else {
+                    VpnStatus::Disconnected
+                };
                 guard.fortinet.virtual_ip = None;
                 (
                     std::mem::take(&mut guard.fortinet.installed_routes),
@@ -1236,6 +1256,15 @@ fn should_drop_log(vpn_type: VpnType, text: &str) -> bool {
             ]
             .iter()
             .any(|keyword| lower.contains(keyword)))
+        || (vpn_type == VpnType::Fortinet
+            && [
+                "pppd ---> gateway",
+                "gateway ---> pppd",
+                "tun ---> gateway",
+                "gateway ---> tun",
+            ]
+            .iter()
+            .any(|keyword| lower.contains(keyword)))
 }
 
 /** 判断 zju-connect 是否正在同步等待短信码/TOTP。 */
@@ -1255,7 +1284,10 @@ fn is_mfa_prompt(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_ipv4_cidr, toml_escape, PIPE_SECURITY_SDDL};
+    use super::{
+        is_valid_ipv4_cidr, should_drop_log, toml_escape, HelperState, PIPE_SECURITY_SDDL,
+    };
+    use crate::vpn::VpnType;
 
     /** 管道 ACL 必须同时保留本机身份限制与 Medium 完整性标签。 */
     #[test]
@@ -1279,5 +1311,36 @@ mod tests {
     #[test]
     fn escapes_atrust_toml_value() {
         assert_eq!(toml_escape("a\\b\"c\nd\r"), "a\\\\b\\\"c\\nd\\r");
+    }
+
+    /** Fortinet 逐包传输日志不得进入管理员 helper 的持久队列。 */
+    #[test]
+    fn drops_fortinet_packet_transport_logs() {
+        assert!(should_drop_log(
+            VpnType::Fortinet,
+            "DEBUG: tun ---> gateway (128 bytes)"
+        ));
+        assert!(should_drop_log(
+            VpnType::Fortinet,
+            "DEBUG: gateway ---> pppd (64 bytes)"
+        ));
+        assert!(!should_drop_log(
+            VpnType::Fortinet,
+            "INFO: Tunnel is up and running."
+        ));
+    }
+
+    /** 快照只返回 UI 已确认序号之后的新日志。 */
+    #[test]
+    fn returns_incremental_helper_logs() {
+        let mut state = HelperState::default();
+        state.push_log(VpnType::Fortinet, "first".to_string());
+        state.push_log(VpnType::Fortinet, "second".to_string());
+
+        let logs = state.logs_after(1);
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].sequence, 2);
+        assert_eq!(logs[0].text, "second");
+        assert!(state.logs_after(u64::MAX).is_empty());
     }
 }

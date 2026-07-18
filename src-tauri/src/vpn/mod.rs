@@ -200,6 +200,8 @@ pub fn emit_vpn_log(app_handle: &AppHandle, vpn_type: VpnType, text: impl Into<S
     let is_noisy_fortinet_transport = vpn_type == VpnType::Fortinet
         && (lower_text.contains("pppd ---> gateway")
             || lower_text.contains("gateway ---> pppd")
+            || lower_text.contains("tun ---> gateway")
+            || lower_text.contains("gateway ---> tun")
             || lower_text.contains("if_config: not ready yet"));
     if is_sensitive || is_noisy_packet_dump || is_noisy_fortinet_transport {
         return;

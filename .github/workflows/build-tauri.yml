@@ -3,6 +3,7 @@ name: Build Tauri App
 on:
   push:
     branches:
+      - 'codex/**'
       - codex/windows-vpn-productization
       - feat/github-actions-build
       - main
@@ -169,6 +170,7 @@ jobs:
           CLEANUP_PATCH_PATH="$(cygpath -u "$GITHUB_WORKSPACE")/scripts/patches/openfortivpn-windows-cleanup.patch"
           LEGACY_CONFIG_PATCH_PATH="$(cygpath -u "$GITHUB_WORKSPACE")/scripts/patches/openfortivpn-windows-legacy-config.patch"
           HTTP_STATUS_PATCH_PATH="$(cygpath -u "$GITHUB_WORKSPACE")/scripts/patches/openfortivpn-windows-http-status.patch"
+          WINDOWS_STABILITY_PATCH_PATH="$(cygpath -u "$GITHUB_WORKSPACE")/scripts/patches/openfortivpn-windows-stability.patch"
           COMMIT='409de945242328d7bea6e225dcfb2f45b7fe70e5'
 
           git -c core.autocrlf=false clone --filter=blob:none --no-checkout \
@@ -181,6 +183,8 @@ jobs:
           git -C "$SOURCE_DIR" apply "$LEGACY_CONFIG_PATCH_PATH"
           git -C "$SOURCE_DIR" apply --check "$HTTP_STATUS_PATCH_PATH"
           git -C "$SOURCE_DIR" apply "$HTTP_STATUS_PATCH_PATH"
+          git -C "$SOURCE_DIR" apply --check "$WINDOWS_STABILITY_PATCH_PATH"
+          git -C "$SOURCE_DIR" apply "$WINDOWS_STABILITY_PATCH_PATH"
 
           cmake -S "$SOURCE_DIR" -B "$SOURCE_DIR/build" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -201,6 +205,9 @@ jobs:
           grep -q 'Wintun adapter destroyed' "$STRINGS_PATH"
           grep -q 'stage: fortisslvpn_xml' "$STRINGS_PATH"
           grep -q 'Legacy FortiOS VPN configuration accepted' "$STRINGS_PATH"
+          grep -q 'Tunnel ended; reconnecting' "$STRINGS_PATH"
+          grep -q 'Sent LCP Echo-Request keepalive' "$STRINGS_PATH"
+          grep -q 'I/O stopped unexpectedly' "$STRINGS_PATH"
           ldd "$OUTPUT_DIR/openfortivpn.exe" | tee "$OUTPUT_DIR/openfortivpn-runtime-dependencies.txt"
           if grep -q 'not found' "$OUTPUT_DIR/openfortivpn-runtime-dependencies.txt"; then
             echo 'openfortivpn Windows 候选仍有缺失的运行库' >&2
@@ -223,8 +230,9 @@ jobs:
             'openfortivpn cleanup patch: scripts/patches/openfortivpn-windows-cleanup.patch',
             'openfortivpn legacy FortiOS config patch: scripts/patches/openfortivpn-windows-legacy-config.patch',
             'openfortivpn HTTP stage patch: scripts/patches/openfortivpn-windows-http-status.patch',
+            'openfortivpn Windows keepalive and diagnostics patch: scripts/patches/openfortivpn-windows-stability.patch',
             'Wintun 0.14.1 official signed amd64 DLL.',
-            'Windows x86_64 物理机的 FortiGate 与 aTrust 真机验收已通过，可进入稳定安装包。'
+            'Windows x86_64 旧基线已完成真机验收；本稳定性补丁候选需在合并 main 前复验。'
           ) | Set-Content -Encoding UTF8 (Join-Path $OutputDir 'CANDIDATE-NOTICE.txt')
 
       - name: Upload Windows engine candidate
@@ -312,7 +320,7 @@ jobs:
           Get-ChildItem $CandidateDir -Filter 'LICENSE-*' -File | Copy-Item -Destination $LicenseDir
           Copy-Item (Join-Path $CandidateDir 'openfortivpn-runtime-dependencies.txt') $LicenseDir
           @(
-            'Windows 稳定版：Windows x86_64 物理机 FortiGate 与 aTrust 验收已通过。',
+            'Windows 候选版：稳定性补丁需在 Windows x86_64 物理机复验后再合并 main。',
             '引擎来源、固定提交与哈希见仓库 scripts/vpn-engines.lock.json。'
           ) | Set-Content -Encoding UTF8 (Join-Path $RuntimeDir 'WINDOWS-NOTICE.txt')
 
@@ -345,10 +353,10 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
 
-      - name: Build isolated Intel openfortivpn
-        if: matrix.update_target == 'darwin-x86_64'
+      - name: Build isolated macOS openfortivpn
+        if: runner.os == 'macOS'
         shell: bash
-        run: ./scripts/build-openfortivpn-intel.sh
+        run: ./scripts/build-openfortivpn-intel.sh "src-tauri/binaries/openfortivpn-${{ matrix.sidecar_suffix }}"
 
       - name: Normalize and Verify macOS Sidecars
         if: runner.os == 'macOS'
@@ -357,13 +365,10 @@ jobs:
           SDK_VERSION=$(xcrun --sdk macosx --show-sdk-version)
           OPENFORTIVPN="src-tauri/binaries/openfortivpn-${{ matrix.sidecar_suffix }}"
           ZJU_CONNECT="src-tauri/binaries/zju-connect-${{ matrix.sidecar_suffix }}"
-          if [ "${{ matrix.update_target }}" = 'darwin-aarch64' ]; then
-            echo '34b86b94cba093fbbfa829109ade986c072117f55d45d6d742695e7d0d89b019  src-tauri/binaries/openfortivpn-aarch64-apple-darwin' | shasum -a 256 -c -
-          else
-            "$OPENFORTIVPN" --version | grep -q '1.24.1'
-            grep -a -q 'stage: fortisslvpn_xml' "$OPENFORTIVPN"
-            grep -a -q 'Legacy FortiOS VPN configuration accepted' "$OPENFORTIVPN"
-          fi
+          "$OPENFORTIVPN" --version | grep -q '1.24.1'
+          grep -a -q 'stage: fortisslvpn_xml' "$OPENFORTIVPN"
+          grep -a -q 'Legacy FortiOS VPN configuration accepted' "$OPENFORTIVPN"
+          grep -a -q 'Tunnel ended; reconnecting' "$OPENFORTIVPN"
           for binary in "$OPENFORTIVPN" "$ZJU_CONNECT"; do
             test -x "$binary"
             file "$binary" | grep -q '${{ matrix.expected_arch }}'

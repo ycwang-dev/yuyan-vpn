@@ -2,9 +2,23 @@
   "schemaVersion": 1,
   "macos": {
     "openfortivpnArm64": {
-      "version": "1.18.0",
-      "sha256": "34b86b94cba093fbbfa829109ade986c072117f55d45d6d742695e7d0d89b019",
-      "policy": "frozen"
+      "version": "1.24.1",
+      "source": "https://github.com/adrienverge/openfortivpn.git",
+      "commit": "a40a2d588733d48534eb78cd17b90142e5ba039b",
+      "license": "GPL-3.0-or-later",
+      "patches": [
+        "scripts/patches/openfortivpn-1.24.1-http-status.patch",
+        "scripts/patches/openfortivpn-1.24.1-legacy-config.patch",
+        "scripts/patches/openfortivpn-1.24.1-transport.patch"
+      ],
+      "staticTls": {
+        "name": "OpenSSL",
+        "version": "3.6.2",
+        "source": "https://github.com/openssl/openssl/releases/download/openssl-3.6.2/openssl-3.6.2.tar.gz",
+        "archiveSha256": "aaf51a1fe064384f811daeaeb4ec4dce7340ec8bd893027eee676af31e83a04f",
+        "macosDeploymentTarget": "12.0"
+      },
+      "policy": "ci-build-and-arm64-real-device-validation"
     },
     "openfortivpnX64": {
       "version": "1.24.1",
@@ -13,7 +27,8 @@
       "license": "GPL-3.0-or-later",
       "patches": [
         "scripts/patches/openfortivpn-1.24.1-http-status.patch",
-        "scripts/patches/openfortivpn-1.24.1-legacy-config.patch"
+        "scripts/patches/openfortivpn-1.24.1-legacy-config.patch",
+        "scripts/patches/openfortivpn-1.24.1-transport.patch"
       ],
       "staticTls": {
         "name": "OpenSSL",
@@ -56,9 +71,10 @@
       "patches": [
         "scripts/patches/openfortivpn-windows-cleanup.patch",
         "scripts/patches/openfortivpn-windows-legacy-config.patch",
-        "scripts/patches/openfortivpn-windows-http-status.patch"
+        "scripts/patches/openfortivpn-windows-http-status.patch",
+        "scripts/patches/openfortivpn-windows-stability.patch"
       ],
-      "policy": "patched-stable-physical-fortigate-validated"
+      "policy": "patched-stability-candidate-requires-physical-fortigate-validation"
     }
   }
 }

@@ -1,0 +1,491 @@
+diff --git a/src/io_win.c b/src/io_win.c
+index c0155eb..68c83f3 100644
+--- a/src/io_win.c
++++ b/src/io_win.c
+@@ -25,6 +25,7 @@
+ #include "wintun.h"
+ #include "ssl.h"
+ #include "log.h"
++#include "event.h"
+ 
+ #include <windows.h>
+ #include <pthread.h>
+@@ -33,6 +34,7 @@
+ #include <string.h>
+ 
+ #define PKT_BUF_SZ 0x1000
++#define LCP_ECHO_INTERVAL_SECONDS 25
+ 
+ /* Windows semaphore abstraction (matching io.c pattern) */
+ typedef HANDLE os_semaphore_t;
+@@ -55,6 +57,54 @@ static volatile LONG shutting_down;
+ /* Global variable to pass signal out of its handler */
+ volatile long sig_received;
+ 
++enum io_stop_reason {
++	IO_STOP_NONE,
++	IO_STOP_SIGNAL,
++	IO_STOP_TLS_READ,
++	IO_STOP_BAD_GATEWAY_FRAME,
++	IO_STOP_PEER_TERMINATED,
++	IO_STOP_TLS_WRITE,
++	IO_STOP_TUN_READ,
++	IO_STOP_TUN_WRITE,
++	IO_STOP_INTERFACE,
++	IO_STOP_INTERNAL
++};
++
++static volatile LONG stop_reason;
++static volatile LONG echo_identifier;
++
++static void request_io_stop(enum io_stop_reason reason)
++{
++	InterlockedCompareExchange(&stop_reason, (LONG)reason, IO_STOP_NONE);
++	SEM_POST(&sem_stop_io);
++}
++
++static const char *io_stop_reason_string(LONG reason)
++{
++	switch (reason) {
++	case IO_STOP_SIGNAL:
++		return "local_signal";
++	case IO_STOP_TLS_READ:
++		return "tls_read_failed";
++	case IO_STOP_BAD_GATEWAY_FRAME:
++		return "invalid_gateway_frame";
++	case IO_STOP_PEER_TERMINATED:
++		return "peer_ppp_terminated";
++	case IO_STOP_TLS_WRITE:
++		return "tls_write_failed";
++	case IO_STOP_TUN_READ:
++		return "wintun_read_failed";
++	case IO_STOP_TUN_WRITE:
++		return "wintun_write_failed";
++	case IO_STOP_INTERFACE:
++		return "interface_configuration_failed";
++	case IO_STOP_INTERNAL:
++		return "internal_io_failure";
++	default:
++		return "unknown";
++	}
++}
++
+ int get_sig_received(void)
+ {
+ 	return (int)sig_received;
+@@ -66,7 +116,7 @@ static BOOL WINAPI win_ctrl_handler(DWORD ctrl_type)
+ 	    ctrl_type == CTRL_BREAK_EVENT ||
+ 	    ctrl_type == CTRL_CLOSE_EVENT) {
+ 		InterlockedExchange(&sig_received, SIGTERM);
+-		SEM_POST(&sem_stop_io);
++		request_io_stop(IO_STOP_SIGNAL);
+ 		return TRUE;
+ 	}
+ 	return FALSE;
+@@ -159,32 +209,44 @@ static void *ssl_read_thread(void *arg)
+ 		int ppp_ret;
+ 
+ 		ret = safe_ssl_read_all(tunnel->ssl_handle, header, 6);
+-		if (ret < 0)
+-			break;
++		if (ret < 0) {
++			log_warn("TLS tunnel read stopped (%s).\n", err_ssl_str(ret));
++			request_io_stop(IO_STOP_TLS_READ);
++			return NULL;
++		}
+ 
+ 		total = (header[0] << 8) | header[1];
+ 		magic = (header[2] << 8) | header[3];
+ 		size  = (header[4] << 8) | header[5];
+ 
+-		if (magic != 0x5050)
+-			break;
++		if (magic != 0x5050 || total < 6 || total - 6 != size) {
++			log_error("Invalid Fortinet gateway frame header.\n");
++			request_io_stop(IO_STOP_BAD_GATEWAY_FRAME);
++			return NULL;
++		}
+ 
+ 		if (size == 0)
+ 			continue;
+ 
+ 		packet = malloc(sizeof(*packet) + 6 + size);
+-		if (!packet)
+-			break;
++		if (!packet) {
++			log_error("Unable to allocate a gateway packet.\n");
++			request_io_stop(IO_STOP_INTERNAL);
++			return NULL;
++		}
+ 		packet->len = size;
+ 
+ 		ret = safe_ssl_read_all(tunnel->ssl_handle,
+ 		                        pkt_data(packet), size);
+ 		if (ret < 0) {
++			log_warn("TLS tunnel payload read stopped (%s).\n",
++			         err_ssl_str(ret));
+ 			free(packet);
+-			break;
++			request_io_stop(IO_STOP_TLS_READ);
++			return NULL;
+ 		}
+ 
+-		log_debug("gateway ---> tun (%u bytes)\n", size);
++		log_debug_all("gateway ---> tun (%u bytes)\n", size);
+ 
+ 		ppp_ret = ppp_process_incoming(ppp_ctx,
+ 		                               pkt_data(packet), size,
+@@ -206,9 +268,11 @@ static void *ssl_read_thread(void *arg)
+ 		} else if (ppp_ret == PPP_RET_NEGOTIATE) {
+ 			SEM_POST(&sem_if_config);
+ 		} else if (ppp_ret == PPP_RET_TERMINATED) {
++			log_warn("FortiGate requested PPP tunnel termination.\n");
+ 			free(response);
+ 			free(packet);
+-			break;
++			request_io_stop(IO_STOP_PEER_TERMINATED);
++			return NULL;
+ 		}
+ 
+ 		if (response) {
+@@ -228,7 +292,6 @@ static void *ssl_read_thread(void *arg)
+ 		free(packet);
+ 	}
+ 
+-	SEM_POST(&sem_stop_io);
+ 	return NULL;
+ }
+ 
+@@ -266,11 +329,16 @@ static void *ssl_write_thread(void *arg)
+ 		                 &shutting_down, 0, 0));
+ 
+ 		free(packet);
+-		if (ret < 0)
+-			break;
++		if (ret < 0) {
++			if (!InterlockedCompareExchange(&shutting_down, 0, 0)) {
++				log_warn("TLS tunnel write stopped (%s).\n",
++				         err_ssl_str(ret));
++				request_io_stop(IO_STOP_TLS_WRITE);
++			}
++			return NULL;
++		}
+ 	}
+ 
+-	SEM_POST(&sem_stop_io);
+ 	return NULL;
+ }
+ 
+@@ -302,8 +370,12 @@ static void *tun_read_thread(void *arg)
+ 		wait_ret = WaitForSingleObject(read_event, 1000);
+ 		if (wait_ret == WAIT_TIMEOUT)
+ 			continue;
+-		if (wait_ret != WAIT_OBJECT_0)
+-			break;
++		if (wait_ret != WAIT_OBJECT_0) {
++			log_error("Waiting for Wintun packets failed (error %lu).\n",
++			          GetLastError());
++			request_io_stop(IO_STOP_TUN_READ);
++			return NULL;
++		}
+ 
+ 		while ((pkt = api->ReceivePacket(session,
+ 		                                 &pkt_size)) != NULL) {
+@@ -323,7 +395,7 @@ static void *tun_read_thread(void *arg)
+ 					pool_push(
+ 					        &tunnel->pty_to_ssl_pool,
+ 					        packet);
+-					log_debug(
++					log_debug_all(
+ 					        "tun ---> gateway (%lu bytes)\n",
+ 					        (unsigned long)ppp_len);
+ 				}
+@@ -337,11 +409,15 @@ static void *tun_read_thread(void *arg)
+ 		 * ReceivePacket returned NULL. If the session was
+ 		 * ended by shutdown, ERROR_INVALID_DATA is set.
+ 		 */
+-		if (GetLastError() == ERROR_INVALID_DATA)
+-			break;
++		if (GetLastError() == ERROR_INVALID_DATA) {
++			if (!InterlockedCompareExchange(&shutting_down, 0, 0)) {
++				log_error("Wintun receive session ended unexpectedly.\n");
++				request_io_stop(IO_STOP_TUN_READ);
++			}
++			return NULL;
++		}
+ 	}
+ 
+-	SEM_POST(&sem_stop_io);
+ 	return NULL;
+ }
+ 
+@@ -376,15 +452,61 @@ static void *tun_write_thread(void *arg)
+ 			memcpy(buf, pkt_data(packet), packet->len);
+ 			api->SendPacket(session, buf);
+ 		} else {
+-			/* Session ended — exit cleanly */
++			if (!InterlockedCompareExchange(&shutting_down, 0, 0)) {
++				log_error("Allocating a Wintun send packet failed (error %lu).\n",
++				          GetLastError());
++				request_io_stop(IO_STOP_TUN_WRITE);
++			}
+ 			free(packet);
+-			break;
++			return NULL;
+ 		}
+ 
+ 		free(packet);
+ 	}
+ 
+-	SEM_POST(&sem_stop_io);
++	return NULL;
++}
++
++/*
++ * Send an RFC 1661 LCP Echo-Request periodically after IPCP is ready.
++ * This keeps NAT mappings and legacy FortiGate sessions active even when
++ * user traffic is idle. Echo replies continue to be handled by ssl_read.
++ */
++static void *keepalive_thread(void *arg)
++{
++	struct tunnel *tunnel = (struct tunnel *)arg;
++	struct ppp_context *ppp_ctx =
++	        (struct ppp_context *)tunnel->ppp_ctx;
++
++	log_debug("%s thread\n", __func__);
++	while (!InterlockedCompareExchange(&shutting_down, 0, 0)) {
++		int elapsed;
++
++		for (elapsed = 0; elapsed < LCP_ECHO_INTERVAL_SECONDS; elapsed++) {
++			if (InterlockedCompareExchange(&shutting_down, 0, 0))
++				return NULL;
++			Sleep(1000);
++		}
++		if (tunnel->state == STATE_UP) {
++			uint8_t *echo_data;
++			size_t echo_len;
++			uint8_t id = (uint8_t)InterlockedIncrement(&echo_identifier);
++
++			if (ppp_build_echo_request(id, ppp_ctx->magic_number,
++			                           &echo_data, &echo_len) == 0) {
++				struct ppp_packet *packet =
++				        malloc(sizeof(*packet) + 6 + echo_len);
++
++				if (packet) {
++					packet->len = echo_len;
++					memcpy(pkt_data(packet), echo_data, echo_len);
++					pool_push(&tunnel->pty_to_ssl_pool, packet);
++					log_debug("Sent LCP Echo-Request keepalive.\n");
++				}
++				free(echo_data);
++			}
++		}
++	}
+ 	return NULL;
+ }
+ 
+@@ -423,7 +545,7 @@ static void *if_config_thread(void *arg)
+ 
+ 	return NULL;
+ error:
+-	SEM_POST(&sem_stop_io);
++	request_io_stop(IO_STOP_INTERFACE);
+ 	return NULL;
+ }
+ 
+@@ -437,8 +559,11 @@ int io_loop(struct tunnel *tunnel)
+ 	pthread_t ssl_read_thr;
+ 	pthread_t ssl_write_thr;
+ 	pthread_t if_config_thr;
++	pthread_t keepalive_thr;
+ 
+ 	InterlockedExchange(&shutting_down, 0);
++	InterlockedExchange(&stop_reason, IO_STOP_NONE);
++	InterlockedExchange(&echo_identifier, 0);
+ 
+ 	SEM_INIT(&sem_ppp_ready, 0, 0);
+ 	SEM_INIT(&sem_if_config, 0, 0);
+@@ -491,13 +616,25 @@ int io_loop(struct tunnel *tunnel)
+ 	    pthread_create(&tun_write_thr, NULL,
+ 	                   tun_write_thread, tunnel) ||
+ 	    pthread_create(&if_config_thr, NULL,
+-	                   if_config_thread, tunnel)) {
++	                   if_config_thread, tunnel) ||
++	    pthread_create(&keepalive_thr, NULL,
++	                   keepalive_thread, tunnel)) {
+ 		log_error("Failed to create I/O threads\n");
+ 		goto err_cleanup;
+ 	}
+ 
+ 	/* Block until any thread signals shutdown */
+ 	SEM_WAIT(&sem_stop_io);
++	{
++		LONG reason = InterlockedCompareExchange(&stop_reason, 0, 0);
++		const char *reason_text = io_stop_reason_string(reason);
++
++		if (reason == IO_STOP_SIGNAL)
++			log_info("I/O stop requested locally (%s).\n", reason_text);
++		else
++			log_warn("I/O stopped unexpectedly (%s).\n", reason_text);
++		event_emit("transport_down", "\"reason\":\"%s\"", reason_text);
++	}
+ 
+ 	/*
+ 	 * Graceful shutdown sequence:
+@@ -545,6 +682,7 @@ int io_loop(struct tunnel *tunnel)
+ 	pthread_join(tun_read_thr, NULL);
+ 	pthread_join(tun_write_thr, NULL);
+ 	pthread_join(if_config_thr, NULL);
++	pthread_join(keepalive_thr, NULL);
+ 
+ 	log_info("I/O threads stopped.\n");
+ 
+diff --git a/src/main.c b/src/main.c
+index f537c12..2006a3d 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -815,9 +815,13 @@ int main(int argc, char *argv[])
+ 		ret = run_tunnel(&cfg);
+ 		if (ret == 0)
+ 			ret = EXIT_SUCCESS;
+-		if ((cfg.persistent > 0) && (get_sig_received() == 0))
++		if ((cfg.persistent > 0) && (get_sig_received() == 0)
++		    && (ret == EXIT_SUCCESS)) {
++			log_info("Tunnel ended; reconnecting in %u seconds.\n", cfg.persistent);
+ 			sleep(cfg.persistent);
+-	} while ((get_sig_received() == 0) && (cfg.persistent != 0));
++		}
++	} while ((get_sig_received() == 0) && (cfg.persistent != 0)
++	         && (ret == EXIT_SUCCESS));
+ 
+ 	goto exit;
+ 
+diff --git a/src/ppp.c b/src/ppp.c
+index 3184cff..9d72337 100644
+--- a/src/ppp.c
++++ b/src/ppp.c
+@@ -84,6 +84,20 @@ static int build_echo_reply(uint8_t id, uint32_t magic,
+ 	return 0;
+ }
+ 
++int ppp_build_echo_request(uint8_t id, uint32_t magic,
++                           uint8_t **out_data, size_t *out_len)
++{
++	uint8_t magic_bytes[4];
++
++	magic_bytes[0] = (uint8_t)(magic >> 24);
++	magic_bytes[1] = (uint8_t)(magic >> 16);
++	magic_bytes[2] = (uint8_t)(magic >> 8);
++	magic_bytes[3] = (uint8_t)magic;
++	return build_control_packet(PPP_PROTO_LCP, PPP_CODE_ECHO_REQ, id,
++	                            magic_bytes, sizeof(magic_bytes),
++	                            out_data, out_len);
++}
++
+ void ppp_init(struct ppp_context *ctx)
+ {
+ 	memset(ctx, 0, sizeof(*ctx));
+diff --git a/src/ppp.h b/src/ppp.h
+index 1b72476..ac598a2 100644
+--- a/src/ppp.h
++++ b/src/ppp.h
+@@ -103,6 +103,13 @@ void ppp_init(struct ppp_context *ctx);
+ int ppp_start_negotiation(struct ppp_context *ctx,
+                           uint8_t **out_data, size_t *out_len);
+ 
++/*
++ * Build an LCP Echo-Request used to keep NAT and FortiGate sessions alive.
++ * The caller supplies a monotonically changing identifier and local magic.
++ */
++int ppp_build_echo_request(uint8_t id, uint32_t magic,
++                           uint8_t **out_data, size_t *out_len);
++
+ /*
+  * Process an incoming PPP packet from the gateway.
+  *
+diff --git a/src/tunnel_win.c b/src/tunnel_win.c
+index 79db153..cf341a3 100644
+--- a/src/tunnel_win.c
++++ b/src/tunnel_win.c
+@@ -34,6 +34,7 @@
+ #include <ws2tcpip.h>
+ #include <windows.h>
+ #include <iphlpapi.h>
++#include <mstcpip.h>
+ 
+ #include <openssl/err.h>
+ #include <openssl/x509v3.h>
+@@ -196,6 +197,18 @@ static int tcp_connect(struct tunnel *tunnel)
+ 		closesocket(sock);
+ 		return -1;
+ 	}
++	{
++		struct tcp_keepalive keepalive = { 1, 30000, 10000 };
++		DWORD bytes_returned = 0;
++
++		if (WSAIoctl(sock, SIO_KEEPALIVE_VALS,
++		             &keepalive, sizeof(keepalive),
++		             NULL, 0, &bytes_returned, NULL, NULL) == SOCKET_ERROR)
++			log_warn("Could not configure TCP keepalive (error %d).\n",
++			         WSAGetLastError());
++		else
++			log_debug("TCP keepalive enabled (idle 30s, interval 10s).\n");
++	}
+ 
+ 	tunnel->ssl_socket = (int)sock;
+ 	return 0;
+@@ -594,7 +607,7 @@ int run_tunnel(struct vpn_config *config)
+ 	/* Step 6: I/O loop (PPP negotiation + packet forwarding) */
+ 	event_emit("state_change", "\"state\":\"connected\"");
+ 	log_debug("Starting IO through the tunnel\n");
+-	io_loop(&tunnel);
++	ret = io_loop(&tunnel);
+ 
+ 	event_emit("state_change", "\"state\":\"disconnecting\"");
+ 	log_debug("Disconnecting\n");
+diff --git a/tests/test_ppp.c b/tests/test_ppp.c
+index f6db4b4..d725090 100644
+--- a/tests/test_ppp.c
++++ b/tests/test_ppp.c
+@@ -367,6 +367,33 @@ static void test_lcp_echo(void)
+ 	PASS();
+ }
+ 
++/*
++ * Test: Build a client-initiated LCP Echo-Request for tunnel keepalive.
++ */
++static void test_build_lcp_echo_request(void)
++{
++	uint8_t *request;
++	size_t request_len;
++	int ret;
++
++	TEST("build client LCP Echo-Request");
++	ret = ppp_build_echo_request(0x2a, 0x12345678,
++	                             &request, &request_len);
++	ASSERT(ret == 0, "should return 0");
++	ASSERT(request_len == 10, "echo request should contain 10 bytes");
++	ASSERT(request[0] == 0xc0 && request[1] == 0x21,
++	       "protocol should be LCP");
++	ASSERT(request[2] == PPP_CODE_ECHO_REQ,
++	       "code should be Echo-Request");
++	ASSERT(request[3] == 0x2a, "identifier should match");
++	ASSERT(request[6] == 0x12 && request[7] == 0x34 &&
++	       request[8] == 0x56 && request[9] == 0x78,
++	       "magic number should be encoded in network order");
++
++	free(request);
++	PASS();
++}
++
+ /*
+  * Test: LCP Terminate-Request generates Terminate-Ack.
+  */
+@@ -527,6 +554,7 @@ int main(void)
+ 	test_ipcp_ack_completes();
+ 	test_ip_packet_extraction();
+ 	test_ip_encapsulation();
++	test_build_lcp_echo_request();
+ 	test_lcp_echo();
+ 	test_lcp_terminate();
+ 	test_unknown_protocol();
