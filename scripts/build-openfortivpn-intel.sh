@@ -132,6 +132,9 @@ test "$(./openfortivpn --version)" = "$OPENFORTIVPN_VERSION"
 grep -a -q 'stage: fortisslvpn_xml' openfortivpn
 grep -a -q 'Legacy FortiOS VPN configuration accepted' openfortivpn
 grep -a -q 'Tunnel ended; reconnecting' openfortivpn
+grep -a -q 'TCP keepalive enabled' openfortivpn
+grep -a -q 'PPP keepalive confirmed' openfortivpn
+grep -a -q 'TLS transport ended while' openfortivpn
 xcrun vtool -show-build openfortivpn | grep -q 'minos 12.0'
 if otool -L openfortivpn | grep -Eq '/(usr/local|opt/homebrew|Cellar|openfortivpn-macos)/'; then
   echo "openfortivpn 仍依赖 Homebrew 或临时目录动态库，禁止进入安装包" >&2

@@ -16,6 +16,9 @@ use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
+#[cfg(target_os = "macos")]
+const EXPECTED_MACOS_OPENFORTIVPN_VERSION: &str = "1.24.1";
+
 /** 创建仅限当前用户读取的 Fortinet 临时配置文件。 */
 fn write_secure_config(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
@@ -25,6 +28,35 @@ fn write_secure_config(path: &std::path::Path, content: &[u8]) -> std::io::Resul
 
     let mut file = options.open(path)?;
     std::io::Write::write_all(&mut file, content)
+}
+
+/** 校验安装包内实际运行的 macOS Fortinet 引擎，拒绝静默回退到旧 sidecar。 */
+#[cfg(target_os = "macos")]
+async fn verify_macos_openfortivpn_version(
+    binary_path: &std::path::Path,
+) -> Result<String, String> {
+    let output = tokio::process::Command::new(binary_path)
+        .arg("--version")
+        .output()
+        .await
+        .map_err(|error| format!("无法读取内置 openfortivpn 版本: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "内置 openfortivpn 版本检查失败: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if version != EXPECTED_MACOS_OPENFORTIVPN_VERSION {
+        return Err(format!(
+            "内置 openfortivpn 版本不安全：期望 {}，实际 {}。请重新构建安装包",
+            EXPECTED_MACOS_OPENFORTIVPN_VERSION,
+            if version.is_empty() { "空" } else { &version }
+        ));
+    }
+
+    Ok(version)
 }
 
 /** macOS 连接 VPN 前的主网络出口。 */
@@ -846,6 +878,12 @@ pub async fn connect_fortinet(
                 openfortivpn_bin.display()
             ));
         }
+        let openfortivpn_version = verify_macos_openfortivpn_version(&openfortivpn_bin).await?;
+        emit_vpn_log(
+            &app_handle,
+            VpnType::Fortinet,
+            format!("Fortinet 引擎版本校验通过：openfortivpn {openfortivpn_version}"),
+        );
 
         let fortinet_config = load_vpn_config(app_handle.clone()).await?.fortinet;
         validate_vpn_connection_config("Fortinet", &fortinet_config)?;

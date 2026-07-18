@@ -92,6 +92,9 @@ jobs:
       - name: Test updater manifest generator
         run: node --test scripts/generate-update-manifest.test.js
 
+      - name: Test macOS sidecar preparation guard
+        run: node --test scripts/prepare-macos-openfortivpn.test.js
+
   windows-engine-feasibility:
     needs: prep-version
     runs-on: windows-latest
@@ -369,6 +372,9 @@ jobs:
           grep -a -q 'stage: fortisslvpn_xml' "$OPENFORTIVPN"
           grep -a -q 'Legacy FortiOS VPN configuration accepted' "$OPENFORTIVPN"
           grep -a -q 'Tunnel ended; reconnecting' "$OPENFORTIVPN"
+          grep -a -q 'TCP keepalive enabled' "$OPENFORTIVPN"
+          grep -a -q 'PPP keepalive confirmed' "$OPENFORTIVPN"
+          grep -a -q 'TLS transport ended while' "$OPENFORTIVPN"
           for binary in "$OPENFORTIVPN" "$ZJU_CONNECT"; do
             test -x "$binary"
             file "$binary" | grep -q '${{ matrix.expected_arch }}'
