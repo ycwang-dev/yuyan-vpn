@@ -11,6 +11,8 @@ export const TRAY_VPN_ACTION_EVENT = 'yuyan:tray-vpn-action';
 export const VPN_AUTH_FORWARD_EVENT = 'yuyan:vpn-auth-required';
 /** 前端内部事件：转发 aTrust 图形验证码。 */
 export const VPN_CAPTCHA_FORWARD_EVENT = 'yuyan:vpn-captcha-required';
+/** 相同认证错误的前端去重窗口。 */
+const AUTH_FEEDBACK_DEDUP_WINDOW_MS = 1500;
 
 /** 托盘支持的 VPN 快捷动作。 */
 export type TrayVpnAction = 'fortinet' | 'atrust' | 'both' | 'disconnectAll';
@@ -46,6 +48,12 @@ export interface VpnCaptchaEventPayload {
   url: string;
 }
 
+/** aTrust 认证失败反馈事件载荷。 */
+interface VpnAuthFeedbackEventPayload {
+  vpnType: 'Atrust';
+  message: string;
+}
+
 /** Dashboard 接收的托盘动作事件载荷。 */
 export interface TrayVpnActionEventPayload {
   action: TrayVpnAction;
@@ -60,6 +68,8 @@ export const useTrayIntegration = () => {
   const unlisteners: UnlistenFn[] = [];
   let disposed = false;
   let navigationSequence = 0;
+  let lastAuthFeedbackMessage = '';
+  let lastAuthFeedbackAt = 0;
 
   /** 注册 Tauri 事件并处理监听器晚于组件销毁返回的竞态。 */
   const registerListener = async <T>(
@@ -158,6 +168,22 @@ export const useTrayIntegration = () => {
     }
   };
 
+  /** 将密码、账号及图形验证码错误直接展示给用户。 */
+  const handleVpnAuthFeedback = (payload: VpnAuthFeedbackEventPayload) => {
+    if (payload.vpnType !== 'Atrust' || !payload.message) return;
+    const content = payload.message.trim();
+    const currentTime = Date.now();
+    if (
+      content === lastAuthFeedbackMessage
+      && currentTime - lastAuthFeedbackAt < AUTH_FEEDBACK_DEDUP_WINDOW_MS
+    ) {
+      return;
+    }
+    lastAuthFeedbackMessage = content;
+    lastAuthFeedbackAt = currentTime;
+    message.error({ content, duration: 8 });
+  };
+
   onMounted(() => {
     if (!isTauri()) return;
     void registerListener<TrayNavigationPayload>('tray-navigate', handleTrayNavigation);
@@ -170,6 +196,10 @@ export const useTrayIntegration = () => {
     void registerListener<VpnCaptchaEventPayload>(
       'vpn-captcha-required',
       handleVpnCaptchaRequired,
+    );
+    void registerListener<VpnAuthFeedbackEventPayload>(
+      'vpn-auth-feedback',
+      handleVpnAuthFeedback,
     );
   });
 

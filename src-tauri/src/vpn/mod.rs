@@ -34,6 +34,12 @@ const ATRUST_PLACEHOLDER_HOST: &str = "atrust.example.com";
 const ATRUST_PLACEHOLDER_USERNAME: &str = "atrustvpn";
 /** 未注入构建参数时用于开源演示的端口。 */
 const PLACEHOLDER_PORT: u16 = 443;
+/** aTrust 仅持久化设备标识与登录 Cookie 的固定文件名。 */
+pub(crate) const ATRUST_CLIENT_DATA_FILE_NAME: &str = "atrust-client-data.json";
+/** 限制本地客户端数据体积，避免异常文件被特权连接流程无界读取。 */
+pub(crate) const MAX_ATRUST_CLIENT_DATA_BYTES: u64 = 256 * 1024;
+/** aTrust 登录态允许持久化的 Cookie 数量上限。 */
+const MAX_ATRUST_COOKIES: usize = 128;
 
 /** 返回构建时注入的字符串，空值时使用公开占位值。 */
 fn packaged_value(value: Option<&'static str>, placeholder: &'static str) -> &'static str {
@@ -162,6 +168,70 @@ pub struct VpnStatePayload {
     pub uptime: u64, // 连接时长（秒）
 }
 
+/** aTrust 认证接口返回的用户可见反馈。 */
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VpnAuthFeedbackPayload {
+    pub vpn_type: VpnType,
+    pub message: String,
+}
+
+/**
+ * 从 zju-connect 的 aTrust 响应日志中提取非零错误码对应的服务端文案。
+ *
+ * 仅接受同时包含 `Code:` 和 `Message:` 的日志，避免把普通诊断信息误当成认证错误。
+ */
+pub(crate) fn extract_atrust_server_error(text: &str) -> Option<String> {
+    let (prefix, code_and_message) = text.split_once("Code:")?;
+    let lower_prefix = prefix.to_lowercase();
+    if prefix.contains('{') || lower_prefix.contains("parsed") {
+        return None;
+    }
+    let (code, message) = code_and_message.split_once("Message:")?;
+    let code = code.trim().trim_end_matches(',').trim();
+    if code.parse::<u64>().ok()? == 0 {
+        return None;
+    }
+    let message = message
+        .split_once(" Data:")
+        .map(|(value, _)| value)
+        .unwrap_or(message)
+        .trim();
+    (!message.is_empty()).then(|| message.to_string())
+}
+
+/** 判断服务端错误是否属于可重试的图形验证码问题。 */
+pub(crate) fn is_atrust_captcha_error(message: &str) -> bool {
+    let lower_message = message.to_lowercase();
+    message.contains("图形验证码") || lower_message.contains("captcha")
+}
+
+/** 首次密码请求的验证码超时是进入验证流程的握手信号，仅在用户确实提交后上报。 */
+pub(crate) fn should_report_atrust_server_error(message: &str, captcha_submitted: bool) -> bool {
+    !is_atrust_captcha_error(message) || captcha_submitted
+}
+
+/** 判断服务端错误是否明确表示账号或密码校验失败。 */
+pub(crate) fn is_atrust_credential_error(message: &str) -> bool {
+    let lower_message = message.to_lowercase();
+    message.contains("用户名或密码")
+        || message.contains("账号或密码")
+        || message.contains("密码错误")
+        || lower_message.contains("incorrect password")
+        || lower_message.contains("invalid password")
+}
+
+/** 向前端发送一次不会被后续通用进程错误覆盖的 aTrust 认证反馈。 */
+pub(crate) fn emit_atrust_auth_feedback(app_handle: &AppHandle, message: impl Into<String>) {
+    let _ = app_handle.emit(
+        "vpn-auth-feedback",
+        VpnAuthFeedbackPayload {
+            vpn_type: VpnType::Atrust,
+            message: message.into(),
+        },
+    );
+}
+
 #[derive(Clone, Serialize)]
 pub struct LogPayload {
     pub vpn_type: VpnType,
@@ -183,9 +253,14 @@ pub fn emit_vpn_log(app_handle: &AppHandle, vpn_type: VpnType, text: impl Into<S
             .iter()
             .all(|value| value.is_ascii_hexdigit())
         && trimmed_text.as_bytes()[8] == b' ';
-    let is_sensitive = ["cookie:", "loaded password"]
-        .iter()
-        .any(|keyword| lower_text.contains(keyword))
+    let is_sensitive = [
+        "cookie:",
+        "loaded password",
+        "client data saved to",
+        "client data file",
+    ]
+    .iter()
+    .any(|keyword| lower_text.contains(keyword))
         || (vpn_type == VpnType::Atrust
             && [
                 "given auth data",
@@ -285,6 +360,8 @@ pub struct VpnManagerInner {
 
     // aTrust 状态与进程句柄
     pub atrust_status: VpnStatus,
+    pub atrust_status_message: Option<String>,
+    pub atrust_captcha_submitted: bool,
     pub atrust_child: Option<tokio::process::Child>,
     pub atrust_watcher: Option<tokio::task::JoinHandle<()>>,
     pub atrust_ip: Option<String>,
@@ -313,6 +390,7 @@ pub struct VpnManagerInner {
 pub struct VpnManager {
     pub inner: Arc<Mutex<VpnManagerInner>>,
     shutting_down: Arc<AtomicBool>,
+    config_operation_lock: Arc<Mutex<()>>,
     #[cfg(target_os = "windows")]
     windows_helper_start_lock: Arc<Mutex<()>>,
     #[cfg(target_os = "windows")]
@@ -335,6 +413,8 @@ impl VpnManager {
                 fortinet_mihomo_state: None,
                 fortinet_config_path: None,
                 atrust_status: VpnStatus::Disconnected,
+                atrust_status_message: None,
+                atrust_captcha_submitted: false,
                 atrust_child: None,
                 atrust_watcher: None,
                 atrust_ip: None,
@@ -357,6 +437,7 @@ impl VpnManager {
                 windows_helper_last_failure: None,
             })),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            config_operation_lock: Arc::new(Mutex::new(())),
             #[cfg(target_os = "windows")]
             windows_helper_start_lock: Arc::new(Mutex::new(())),
             #[cfg(target_os = "windows")]
@@ -403,6 +484,155 @@ fn get_config_path(app_handle: &AppHandle) -> std::path::PathBuf {
         .app_config_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .join("vpn_config.json")
+}
+
+/** aTrust 客户端登录态的固定存储路径，不包含 SID 或服务端资源数据。 */
+pub(crate) fn atrust_client_data_path(
+    app_handle: &AppHandle,
+) -> Result<std::path::PathBuf, String> {
+    app_handle
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("获取 aTrust 登录状态目录失败: {error}"))
+        .map(|directory| {
+            directory
+                .join(".runtime")
+                .join(ATRUST_CLIENT_DATA_FILE_NAME)
+        })
+}
+
+/** aTrust 客户端数据中可安全复用的认证材料等级。 */
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AtrustClientDataState {
+    Empty,
+    DeviceOnly,
+    Reusable,
+}
+
+/** 校验单条 aTrust Cookie 是否符合 zju-connect 的持久化结构。 */
+fn is_valid_atrust_cookie(value: &serde_json::Value) -> bool {
+    let Some(cookie) = value.as_object() else {
+        return false;
+    };
+    let Some(host) = cookie.get("host").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(scheme) = cookie.get("scheme").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(name) = cookie.get("name").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(cookie_value) = cookie.get("value").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    !host.is_empty()
+        && host.len() <= 255
+        && !host.contains(['\r', '\n'])
+        && scheme == "https"
+        && !name.is_empty()
+        && name.len() <= 256
+        && !name.contains(['\r', '\n'])
+        && cookie_value.len() <= 16 * 1024
+        && !cookie_value.contains(['\r', '\n'])
+}
+
+/** 校验 zju-connect 生成的 128 位十六进制设备标识。 */
+fn is_valid_atrust_device_id(device_id: &str) -> bool {
+    device_id.len() == 32 && device_id.bytes().all(|value| value.is_ascii_hexdigit())
+}
+
+/**
+ * 校验 aTrust 客户端数据 JSON，并区分设备标识与可复用 Cookie。
+ *
+ * 未知字段会被保留兼容；已知字段类型异常时拒绝交给特权子进程解析。
+ */
+pub(crate) fn classify_atrust_client_data(content: &[u8]) -> Option<AtrustClientDataState> {
+    if content.len() as u64 > MAX_ATRUST_CLIENT_DATA_BYTES {
+        return None;
+    }
+    let value = serde_json::from_slice::<serde_json::Value>(content).ok()?;
+    let object = value.as_object()?;
+    let device_id = match object.get("device_id") {
+        Some(value) => value.as_str()?,
+        None => "",
+    };
+    let cookies: &[serde_json::Value] = match object.get("cookies") {
+        Some(value) => value.as_array()?.as_slice(),
+        None => &[],
+    };
+    if (!device_id.is_empty() && !is_valid_atrust_device_id(device_id))
+        || cookies.len() > MAX_ATRUST_COOKIES
+        || !cookies.iter().all(is_valid_atrust_cookie)
+    {
+        return None;
+    }
+
+    if !device_id.is_empty() && !cookies.is_empty() {
+        Some(AtrustClientDataState::Reusable)
+    } else if !device_id.is_empty() {
+        Some(AtrustClientDataState::DeviceOnly)
+    } else {
+        Some(AtrustClientDataState::Empty)
+    }
+}
+
+/** 判断影响 aTrust 登录态归属的服务器、账号或密码是否发生变化。 */
+fn atrust_login_identity_changed(previous: &VpnConfig, current: &VpnConfig) -> bool {
+    !previous.host.eq_ignore_ascii_case(&current.host)
+        || previous.port != current.port
+        || previous.username != current.username
+        || previous.password != current.password
+}
+
+/**
+ * 清除 aTrust Cookie，同时尽量保留稳定设备 ID，避免凭据变更后复用旧登录态。
+ */
+fn invalidate_atrust_login_state(app_handle: &AppHandle) -> Result<(), String> {
+    let path = atrust_client_data_path(app_handle)?;
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("检查 aTrust 登录状态失败: {error}")),
+    };
+    if metadata.file_type().is_symlink() {
+        return std::fs::remove_file(&path)
+            .map_err(|error| format!("移除异常的 aTrust 登录状态链接失败: {error}"));
+    }
+    if !metadata.is_file() {
+        return Err("aTrust 登录状态路径不是普通文件，已拒绝覆盖".to_string());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.nlink() > 1 {
+            return std::fs::remove_file(&path)
+                .map_err(|error| format!("移除异常的 aTrust 登录状态硬链接失败: {error}"));
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("收紧 aTrust 登录状态权限失败: {error}"))?;
+    }
+
+    let device_id = (metadata.len() <= MAX_ATRUST_CLIENT_DATA_BYTES)
+        .then(|| std::fs::read(&path).ok())
+        .flatten()
+        .and_then(|content| serde_json::from_slice::<serde_json::Value>(&content).ok())
+        .and_then(|value| {
+            value
+                .get("device_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| is_valid_atrust_device_id(value))
+                .map(str::to_string)
+        });
+    let content = serde_json::json!({
+        "cookies": [],
+        "device_id": device_id.unwrap_or_default(),
+    });
+    let serialized = serde_json::to_vec(&content)
+        .map_err(|error| format!("重置 aTrust 登录状态失败: {error}"))?;
+    std::fs::write(&path, serialized)
+        .map_err(|error| format!("清除过期 aTrust Cookie 失败: {error}"))
 }
 
 /**
@@ -574,16 +804,53 @@ fn default_settings() -> AppVpnSettings {
 #[tauri::command]
 pub async fn save_vpn_config(
     app_handle: AppHandle,
+    state: State<'_, VpnManager>,
     settings: AppVpnSettings,
 ) -> Result<(), String> {
+    let _config_guard = state.config_operation_lock.lock().await;
     let path = get_config_path(&app_handle);
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("创建 VPN 配置目录失败: {error}"))?;
     }
     let normalized_settings = normalize_settings(settings)?;
+    let previous_settings = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<AppVpnSettings>(&content).ok())
+        .and_then(|settings| normalize_settings(settings).ok());
+    let should_invalidate_atrust_login = previous_settings
+        .as_ref()
+        .map(|previous| {
+            atrust_login_identity_changed(&previous.atrust, &normalized_settings.atrust)
+        })
+        .unwrap_or_else(|| atrust_client_data_path(&app_handle).is_ok_and(|path| path.exists()));
+
+    if should_invalidate_atrust_login {
+        let inner = state.inner.lock().await;
+        let is_active = matches!(
+            inner.atrust_status,
+            VpnStatus::Connecting
+                | VpnStatus::Authenticating
+                | VpnStatus::Connected
+                | VpnStatus::Disconnecting
+        ) || inner.atrust_child.is_some();
+        drop(inner);
+        if is_active {
+            return Err("修改 aTrust 登录凭据前请先断开长沙服务器".to_string());
+        }
+        invalidate_atrust_login_state(&app_handle)?;
+    }
+
     let json_str = serde_json::to_string_pretty(&normalized_settings)
         .map_err(|e| format!("序列化配置失败: {e}"))?;
     std::fs::write(&path, json_str).map_err(|e| format!("写入配置文件失败: {e}"))?;
+    if should_invalidate_atrust_login {
+        emit_vpn_log(
+            &app_handle,
+            VpnType::Atrust,
+            "aTrust 登录凭据已变化，旧 Cookie 已清除并保留设备标识",
+        );
+    }
     Ok(())
 }
 
@@ -672,16 +939,18 @@ pub async fn get_vpn_state(
     windows::refresh(&_app_handle, state.inner()).await?;
 
     let inner = state.inner.lock().await;
-    let (status, ip, start_time) = match vpn_type {
+    let (status, ip, start_time, status_message) = match vpn_type {
         VpnType::Fortinet => (
             inner.fortinet_status,
             &inner.fortinet_ip,
             inner.fortinet_start_time,
+            None,
         ),
         VpnType::Atrust => (
             inner.atrust_status,
             &inner.atrust_ip,
             inner.atrust_start_time,
+            inner.atrust_status_message.clone(),
         ),
     };
 
@@ -690,14 +959,14 @@ pub async fn get_vpn_state(
     Ok(VpnStatePayload {
         vpn_type,
         status,
-        message: match status {
+        message: status_message.unwrap_or_else(|| match status {
             VpnStatus::Disconnected => "未连接".to_string(),
             VpnStatus::Connecting => "正在建立安全通道...".to_string(),
             VpnStatus::Authenticating => "等待二次验证...".to_string(),
             VpnStatus::Connected => "已连接，内网路由已就绪".to_string(),
             VpnStatus::Disconnecting => "正在断开...".to_string(),
             VpnStatus::Error => "连接出错，请检查日志".to_string(),
-        },
+        }),
         virtual_ip: ip.clone(),
         uptime,
     })
@@ -751,9 +1020,131 @@ pub struct VpnCaptchaPayload {
 #[cfg(test)]
 mod tests {
     use super::{
-        migrate_packaged_endpoint, normalize_fortinet_routes, normalize_ipv4_cidr,
-        validate_vpn_connection_config, VpnConfig,
+        atrust_login_identity_changed, classify_atrust_client_data, extract_atrust_server_error,
+        is_atrust_captcha_error, is_atrust_credential_error, migrate_packaged_endpoint,
+        normalize_fortinet_routes, normalize_ipv4_cidr, should_report_atrust_server_error,
+        validate_vpn_connection_config, AtrustClientDataState, VpnConfig,
     };
+
+    /** 创建用于登录态归属测试的最小 aTrust 配置。 */
+    fn atrust_config(username: &str, password: &str) -> VpnConfig {
+        VpnConfig {
+            enabled: true,
+            host: "vpn.example.edu".to_string(),
+            port: 443,
+            username: username.to_string(),
+            password: Some(password.to_string()),
+            save_password: true,
+            custom_routes: Vec::new(),
+        }
+    }
+
+    /** 验证 aTrust 非零错误码会保留完整服务端认证文案。 */
+    #[test]
+    fn extracts_atrust_server_authentication_error() {
+        let password_error =
+            "2026/07/18 Code: 75500000, Message: 用户名或密码错误，您还有47次尝试的机会";
+        let captcha_error = "2026/07/18 Code: 75500308, Message: 图形验证码错误";
+
+        assert_eq!(
+            extract_atrust_server_error(password_error),
+            Some("用户名或密码错误，您还有47次尝试的机会".to_string())
+        );
+        assert!(is_atrust_credential_error(
+            &extract_atrust_server_error(password_error).expect("应提取密码错误")
+        ));
+        assert!(is_atrust_captcha_error(
+            &extract_atrust_server_error(captcha_error).expect("应提取验证码错误")
+        ));
+    }
+
+    /** 验证成功响应和普通诊断日志不会被误判为认证错误。 */
+    #[test]
+    fn ignores_non_error_atrust_logs() {
+        assert_eq!(
+            extract_atrust_server_error("Code: 0, Message: success"),
+            None
+        );
+        assert_eq!(
+            extract_atrust_server_error("Login error: ticket is empty"),
+            None
+        );
+        assert_eq!(
+            extract_atrust_server_error(
+                "Parsed psw: {Code:75500000 Message:用户名或密码错误 Data:{Ticket: GraphCheckCodeEnable:0}}"
+            ),
+            None
+        );
+    }
+
+    /** 验证首次握手的伪超时被忽略，用户提交验证码后的真实错误仍会上报。 */
+    #[test]
+    fn reports_captcha_error_only_after_submission() {
+        let message = "图形验证码已超时，请重试";
+        assert!(!should_report_atrust_server_error(message, false));
+        assert!(should_report_atrust_server_error(message, true));
+        assert!(should_report_atrust_server_error(
+            "用户名或密码错误，您还有47次尝试的机会",
+            false
+        ));
+    }
+
+    /** 验证客户端数据仅在结构合法且同时包含设备 ID 与 Cookie 时可直接复用。 */
+    #[test]
+    fn classifies_atrust_client_data_safely() {
+        assert_eq!(
+            classify_atrust_client_data(br#"{}"#),
+            Some(AtrustClientDataState::Empty)
+        );
+        assert_eq!(
+            classify_atrust_client_data(
+                br#"{"device_id":"0123456789abcdef0123456789abcdef","cookies":[]}"#
+            ),
+            Some(AtrustClientDataState::DeviceOnly)
+        );
+        assert_eq!(
+            classify_atrust_client_data(
+                br#"{"device_id":"0123456789abcdef0123456789abcdef","cookies":[{"host":"vpn.example.edu","scheme":"https","name":"sid","value":"secret"}]}"#
+            ),
+            Some(AtrustClientDataState::Reusable)
+        );
+        assert_eq!(
+            classify_atrust_client_data(br#"{"device_id":7,"cookies":[]}"#),
+            None
+        );
+        assert_eq!(
+            classify_atrust_client_data(
+                br#"{"device_id":"0123456789abcdef0123456789abcdef","cookies":[{}]}"#
+            ),
+            None
+        );
+        assert_eq!(
+            classify_atrust_client_data(br#"{"device_id":"device-1","cookies":[]}"#),
+            None
+        );
+        assert_eq!(
+            classify_atrust_client_data(&vec![b' '; 256 * 1024 + 1]),
+            None
+        );
+    }
+
+    /** 验证服务器、账号或密码变化会使旧 Cookie 失效，主机名大小写不触发误清理。 */
+    #[test]
+    fn invalidates_atrust_login_state_when_identity_changes() {
+        let original = atrust_config("alice", "old-password");
+        let mut current = original.clone();
+        current.host = "VPN.EXAMPLE.EDU".to_string();
+        assert!(!atrust_login_identity_changed(&original, &current));
+
+        current.password = Some("new-password".to_string());
+        assert!(atrust_login_identity_changed(&original, &current));
+        current = original.clone();
+        current.username = "bob".to_string();
+        assert!(atrust_login_identity_changed(&original, &current));
+        current = original.clone();
+        current.port = 8443;
+        assert!(atrust_login_identity_changed(&original, &current));
+    }
 
     /** 验证带主机位的输入会归一为网络地址。 */
     #[test]

@@ -1,5 +1,6 @@
 use crate::vpn::{VpnConfig, VpnStatus, VpnType};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /** Windows UAC helper 的内部启动参数。 */
 pub const HELPER_ARGUMENT: &str = "--yuyan-vpn-helper";
@@ -9,11 +10,24 @@ pub const HELPER_ARGUMENT: &str = "--yuyan-vpn-helper";
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum HelperCommand {
     Ping,
-    ConnectFortinet { config: VpnConfig, password: String },
-    ConnectAtrust { config: VpnConfig, password: String },
-    Disconnect { vpn_type: VpnType },
-    SubmitMfa { code: String },
-    Snapshot { after_sequence: u64 },
+    ConnectFortinet {
+        config: VpnConfig,
+        password: String,
+    },
+    ConnectAtrust {
+        config: VpnConfig,
+        password: String,
+        client_data_path: PathBuf,
+    },
+    Disconnect {
+        vpn_type: VpnType,
+    },
+    SubmitMfa {
+        code: String,
+    },
+    Snapshot {
+        after_sequence: u64,
+    },
     Shutdown,
 }
 

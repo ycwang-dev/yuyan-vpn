@@ -94,6 +94,8 @@ async fn cleanup_local_resources(manager: &VpnManager) {
         inner.fortinet_ip = None;
         inner.fortinet_start_time = None;
         inner.atrust_status = VpnStatus::Disconnected;
+        inner.atrust_status_message = None;
+        inner.atrust_captcha_submitted = false;
         inner.atrust_ip = None;
         inner.atrust_start_time = None;
         inner.atrust_stdin = None;

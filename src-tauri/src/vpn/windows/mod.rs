@@ -3,8 +3,9 @@ mod ipc;
 
 use self::ipc::{HelperCommand, HelperEnvelope, HelperResponse, HELPER_ARGUMENT};
 use super::{
-    emit_vpn_log, VpnAuthPayload, VpnCaptchaPayload, VpnConfig, VpnManager, VpnStatePayload,
-    VpnStatus, VpnType,
+    emit_atrust_auth_feedback, emit_vpn_log, extract_atrust_server_error, is_atrust_captcha_error,
+    should_report_atrust_server_error, VpnAuthPayload, VpnCaptchaPayload, VpnConfig, VpnManager,
+    VpnStatePayload, VpnStatus, VpnType,
 };
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
@@ -169,11 +170,24 @@ pub async fn connect_atrust(
     manager: &VpnManager,
     config: VpnConfig,
     password: String,
+    client_data_path: PathBuf,
 ) -> Result<(), String> {
     manager.ensure_connections_allowed()?;
     require_helper(manager).await?;
-    let response =
-        request_with_session(manager, HelperCommand::ConnectAtrust { config, password }).await?;
+    {
+        let mut inner = manager.inner.lock().await;
+        inner.atrust_status_message = None;
+        inner.atrust_captcha_submitted = false;
+    }
+    let response = request_with_session(
+        manager,
+        HelperCommand::ConnectAtrust {
+            config,
+            password,
+            client_data_path,
+        },
+    )
+    .await?;
     apply_response(app_handle, manager, response).await
 }
 
@@ -328,7 +342,7 @@ async fn apply_response(
             .unwrap_or_else(|| "Windows VPN helper 操作失败".to_string()));
     }
 
-    let (new_logs, auth_prompt, changed_states) = {
+    let (new_logs, auth_feedbacks, auth_prompt, changed_states) = {
         let mut inner = manager.inner.lock().await;
         let previous_fortinet = inner.fortinet_status;
         let previous_atrust = inner.atrust_status;
@@ -344,6 +358,13 @@ async fn apply_response(
         inner.fortinet_ip = response.snapshot.fortinet.virtual_ip.clone();
         inner.atrust_status = response.snapshot.atrust.status;
         inner.atrust_ip = response.snapshot.atrust.virtual_ip.clone();
+        if matches!(
+            response.snapshot.atrust.status,
+            VpnStatus::Disconnected | VpnStatus::Connected
+        ) {
+            inner.atrust_status_message = None;
+            inner.atrust_captcha_submitted = false;
+        }
 
         let logs = response
             .logs
@@ -353,6 +374,40 @@ async fn apply_response(
         if let Some(last) = logs.last() {
             inner.windows_log_sequence = last.sequence;
         }
+        if previous_atrust != VpnStatus::Connecting
+            && response.snapshot.atrust.status == VpnStatus::Connecting
+        {
+            inner.atrust_status_message = None;
+            inner.atrust_captcha_submitted = false;
+        }
+        let mut feedbacks = Vec::new();
+        for log in logs.iter().filter(|item| item.vpn_type == VpnType::Atrust) {
+            let lower_text = log.text.to_lowercase();
+            if lower_text.contains("captcha code received from browser") {
+                inner.atrust_captcha_submitted = true;
+                continue;
+            }
+            if let Some(server_message) = extract_atrust_server_error(&log.text) {
+                if should_report_atrust_server_error(
+                    &server_message,
+                    inner.atrust_captcha_submitted,
+                ) {
+                    inner.atrust_status_message = Some(server_message.clone());
+                    if is_atrust_captcha_error(&server_message) {
+                        inner.atrust_captcha_submitted = false;
+                    }
+                    if feedbacks.last() != Some(&server_message) {
+                        feedbacks.push(server_message);
+                    }
+                }
+            }
+            if extract_captcha_url(&log.text).is_some() {
+                inner.atrust_captcha_submitted = false;
+            }
+        }
+        if response.snapshot.atrust.status == VpnStatus::Error {
+            inner.atrust_captcha_submitted = false;
+        }
         let prompt = if response.snapshot.auth_sequence > inner.windows_auth_sequence {
             inner.windows_auth_sequence = response.snapshot.auth_sequence;
             response.snapshot.auth_prompt.clone()
@@ -361,6 +416,7 @@ async fn apply_response(
         };
         (
             logs,
+            feedbacks,
             prompt,
             [
                 (
@@ -368,16 +424,22 @@ async fn apply_response(
                     previous_fortinet,
                     inner.fortinet_status,
                     inner.fortinet_ip.clone(),
+                    None,
                 ),
                 (
                     VpnType::Atrust,
                     previous_atrust,
                     inner.atrust_status,
                     inner.atrust_ip.clone(),
+                    inner.atrust_status_message.clone(),
                 ),
             ],
         )
     };
+
+    for feedback in auth_feedbacks {
+        emit_atrust_auth_feedback(app_handle, feedback);
+    }
 
     for log in new_logs {
         if log.vpn_type == VpnType::Atrust {
@@ -393,14 +455,15 @@ async fn apply_response(
         }
         emit_vpn_log(app_handle, log.vpn_type, log.text);
     }
-    for (vpn_type, previous, status, virtual_ip) in changed_states {
+    for (vpn_type, previous, status, virtual_ip, status_message) in changed_states {
         if previous != status {
             let _ = app_handle.emit(
                 "vpn-status-changed",
                 VpnStatePayload {
                     vpn_type,
                     status,
-                    message: windows_status_message(vpn_type, status).to_string(),
+                    message: status_message
+                        .unwrap_or_else(|| windows_status_message(vpn_type, status).to_string()),
                     virtual_ip,
                     uptime: 0,
                 },
@@ -456,6 +519,8 @@ async fn reset_manager_engine(manager: &VpnManager, vpn_type: VpnType) {
         }
         VpnType::Atrust => {
             inner.atrust_status = VpnStatus::Disconnected;
+            inner.atrust_status_message = None;
+            inner.atrust_captcha_submitted = false;
             inner.atrust_ip = None;
             inner.atrust_start_time = None;
         }

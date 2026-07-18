@@ -1,7 +1,10 @@
 use super::ipc::{
     EngineSnapshot, HelperCommand, HelperEnvelope, HelperLog, HelperResponse, HelperSnapshot,
 };
-use crate::vpn::{VpnConfig, VpnStatus, VpnType};
+use crate::vpn::{
+    classify_atrust_client_data, AtrustClientDataState, VpnConfig, VpnStatus, VpnType,
+    ATRUST_CLIENT_DATA_FILE_NAME, MAX_ATRUST_CLIENT_DATA_BYTES,
+};
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
@@ -40,6 +43,8 @@ const PROCESS_SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
 const FORTINET_INTERFACE: &str = "openfortivpn";
 /** Windows zju-connect 固定创建的 Wintun 适配器名。 */
 const ATRUST_INTERFACE: &str = "ZJU Connect";
+/** 必须与 Tauri identifier 保持一致，用于限制管理员 helper 的持久化写入范围。 */
+const APP_DATA_DIRECTORY: &str = "cn.yuyan.swiftvpn";
 /** 当前 FortiGate 证书白名单摘要，与既有 macOS 连接策略保持一致。 */
 const FORTINET_TRUSTED_CERT: &str =
     "491a5bbe4cc44c3e42141d9babfbdd29eee75aaf36401221a1dac9305c846b56";
@@ -415,9 +420,13 @@ async fn execute_command(
                 }
             }
         }
-        HelperCommand::ConnectAtrust { config, password } => {
+        HelperCommand::ConnectAtrust {
+            config,
+            password,
+            client_data_path,
+        } => {
             let previous_status = state.lock().await.atrust.status;
-            match connect_atrust(state, job, config, password).await {
+            match connect_atrust(state, job, config, password, client_data_path).await {
                 Ok(()) => Ok(false),
                 Err(error) => {
                     if !matches!(
@@ -554,6 +563,7 @@ async fn connect_atrust(
     job: &Arc<JobHandle>,
     config: VpnConfig,
     password: String,
+    client_data_path: PathBuf,
 ) -> Result<(), String> {
     {
         let guard = state.lock().await;
@@ -583,14 +593,19 @@ async fn connect_atrust(
     ensure_engine_files(&binary, true)?;
     let engine_directory = engine_directory()?;
     let runtime_directory = engine_runtime_directory()?;
+    let prepared_client_data = prepare_atrust_client_data(&client_data_path).await?;
+    state.lock().await.push_log(
+        VpnType::Atrust,
+        atrust_client_data_log(&prepared_client_data).to_string(),
+    );
     let config_path = unique_temp_path("atrust", "toml");
-    let toml = build_atrust_config(&config, &password);
+    let toml = build_atrust_config(&config, &password, &client_data_path);
     let mut config_file = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(&config_path)
         .map_err(|error| format!("创建 Windows aTrust 临时配置失败: {error}"))?;
-    if let Err(error) = restrict_temp_file_access(&config_path).await {
+    if let Err(error) = restrict_private_path_access(&config_path, "VPN 临时配置").await {
         drop(config_file);
         let _ = std::fs::remove_file(&config_path);
         return Err(error);
@@ -813,7 +828,9 @@ async fn handle_atrust_log(text: &str, state: &Arc<Mutex<HelperState>>) {
         if text.contains("Use DNS server ") || text.contains("No DNS server provided by server") {
             guard.atrust.stack_ready = true;
         }
-        if is_mfa_prompt(text) {
+        if text.contains("http://127.0.0.1:") {
+            guard.atrust.status = VpnStatus::Authenticating;
+        } else if is_mfa_prompt(text) {
             guard.atrust.status = VpnStatus::Authenticating;
             guard.auth_prompt = Some(text.to_string());
             guard.auth_sequence = guard.auth_sequence.saturating_add(1);
@@ -1113,8 +1130,130 @@ fn is_valid_ipv4_cidr(route: &str) -> bool {
             .unwrap_or(false)
 }
 
-/** 生成不包含持久会话数据的 aTrust TOML。 */
-fn build_atrust_config(config: &VpnConfig, password: &str) -> String {
+/** Windows 启动前得到的 aTrust 客户端登录态检查结果。 */
+struct PreparedAtrustClientData {
+    state: AtrustClientDataState,
+    reset_invalid: bool,
+}
+
+/** 返回 Windows 普通 UI 进程唯一允许 helper 写入的 aTrust 登录状态路径。 */
+fn expected_atrust_client_data_path() -> Result<PathBuf, String> {
+    let roaming_data = std::env::var_os("APPDATA").ok_or_else(|| {
+        "无法确定 Windows 当前用户数据目录，已拒绝持久化 aTrust 登录状态".to_string()
+    })?;
+    Ok(PathBuf::from(roaming_data)
+        .join(APP_DATA_DIRECTORY)
+        .join(".runtime")
+        .join(ATRUST_CLIENT_DATA_FILE_NAME))
+}
+
+/** 检查 Windows 路径是否包含可能让管理员写入越界的重解析点。 */
+fn is_windows_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/** 校验并按层创建普通目录，禁止通过 junction/symlink 改写管理员 helper 目标。 */
+fn ensure_plain_directory(path: &Path, label: &str) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || is_windows_reparse_point(&metadata) {
+                return Err(format!("{label}不是安全的普通目录"));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(path).map_err(|error| format!("创建{label}失败: {error}"))?;
+        }
+        Err(error) => return Err(format!("检查{label}失败: {error}")),
+    }
+    Ok(())
+}
+
+/**
+ * 创建或校验 Windows aTrust 客户端数据文件，并用 ACL 限定当前用户与系统管理员。
+ */
+async fn prepare_atrust_client_data(path: &Path) -> Result<PreparedAtrustClientData, String> {
+    let expected_path = expected_atrust_client_data_path()?;
+    if !path
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&expected_path.to_string_lossy())
+    {
+        return Err("Windows aTrust 登录状态路径超出应用数据目录，已拒绝连接".to_string());
+    }
+
+    let app_directory = expected_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| "Windows aTrust 登录状态路径不完整".to_string())?;
+    let runtime_directory = expected_path
+        .parent()
+        .ok_or_else(|| "Windows aTrust 登录状态路径缺少运行目录".to_string())?;
+    ensure_plain_directory(app_directory, " Windows 应用数据目录")?;
+    ensure_plain_directory(runtime_directory, " Windows aTrust 登录状态目录")?;
+    restrict_private_path_access(runtime_directory, "aTrust 登录状态目录").await?;
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("检查 Windows aTrust 登录状态文件失败: {error}")),
+    };
+    let Some(metadata) = metadata else {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| format!("创建 Windows aTrust 登录状态文件失败: {error}"))?;
+        if let Err(error) = restrict_private_path_access(path, "aTrust 登录状态文件").await {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(error);
+        }
+        std::io::Write::write_all(&mut file, b"{}")
+            .map_err(|error| format!("初始化 Windows aTrust 登录状态文件失败: {error}"))?;
+        return Ok(PreparedAtrustClientData {
+            state: AtrustClientDataState::Empty,
+            reset_invalid: false,
+        });
+    };
+
+    if !metadata.is_file() || is_windows_reparse_point(&metadata) {
+        return Err("Windows aTrust 登录状态文件不是安全的普通文件".to_string());
+    }
+    restrict_private_path_access(path, "aTrust 登录状态文件").await?;
+    if metadata.len() <= MAX_ATRUST_CLIENT_DATA_BYTES {
+        let content = std::fs::read(path)
+            .map_err(|error| format!("读取 Windows aTrust 登录状态文件失败: {error}"))?;
+        if let Some(state) = classify_atrust_client_data(&content) {
+            return Ok(PreparedAtrustClientData {
+                state,
+                reset_invalid: false,
+            });
+        }
+    }
+
+    std::fs::write(path, b"{}")
+        .map_err(|error| format!("重置损坏的 Windows aTrust 登录状态文件失败: {error}"))?;
+    Ok(PreparedAtrustClientData {
+        state: AtrustClientDataState::Empty,
+        reset_invalid: true,
+    })
+}
+
+/** 生成不包含 Cookie、设备 ID 或本地路径的登录态复用日志。 */
+fn atrust_client_data_log(prepared: &PreparedAtrustClientData) -> &'static str {
+    if prepared.reset_invalid {
+        return "检测到损坏的 aTrust 登录状态，已安全重置并重新认证";
+    }
+    match prepared.state {
+        AtrustClientDataState::Reusable => "检测到可复用的 aTrust 登录状态，优先免验证码登录",
+        AtrustClientDataState::DeviceOnly => "已复用 aTrust 设备标识，将重新执行身份认证",
+        AtrustClientDataState::Empty => "未检测到 aTrust 登录状态，将执行首次身份认证",
+    }
+}
+
+/** 生成仅持久化 Cookie 与设备 ID、不复用资源数据的 aTrust TOML。 */
+fn build_atrust_config(config: &VpnConfig, password: &str, client_data_path: &Path) -> String {
     format!(
         r#"protocol = "atrust"
 server_address = "{}"
@@ -1132,12 +1271,13 @@ fake_ip = false
 debug_dump = false
 auth_type = "auth/psw"
 login_domain = "local"
-client_data_file = ""
+client_data_file = "{}"
 "#,
         toml_escape(&config.host),
         config.port,
         toml_escape(&config.username),
         toml_escape(password),
+        toml_escape(&client_data_path.to_string_lossy()),
     )
 }
 
@@ -1210,43 +1350,50 @@ fn unique_temp_path(prefix: &str, extension: &str) -> PathBuf {
     ))
 }
 
-/** 在写入明文前移除临时文件继承权限，只允许当前用户、SYSTEM 与管理员读取。 */
-async fn restrict_temp_file_access(path: &Path) -> Result<(), String> {
+/** 移除文件或目录的继承权限，只允许当前用户、SYSTEM 与管理员访问。 */
+async fn restrict_private_path_access(path: &Path, label: &str) -> Result<(), String> {
     let username = std::env::var("USERNAME")
-        .map_err(|_| "无法确定 Windows 当前用户，已拒绝创建明文 VPN 临时配置".to_string())?;
+        .map_err(|_| format!("无法确定 Windows 当前用户，已拒绝访问{label}"))?;
     let domain = std::env::var("USERDOMAIN").unwrap_or_default();
     let principal = if domain.is_empty() {
         username
     } else {
         format!("{domain}\\{username}")
     };
+    let permission = if path.is_dir() { "(OI)(CI)(F)" } else { "(F)" };
     let status = Command::new("icacls.exe")
         .arg(path)
         .arg("/inheritance:r")
         .arg("/grant:r")
-        .arg(format!("{principal}:(F)"))
+        .arg(format!("{principal}:{permission}"))
         .arg("/grant:r")
-        .arg("*S-1-5-18:(F)")
+        .arg(format!("*S-1-5-18:{permission}"))
         .arg("/grant:r")
-        .arg("*S-1-5-32-544:(F)")
+        .arg(format!("*S-1-5-32-544:{permission}"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .await
-        .map_err(|error| format!("限制 Windows VPN 临时配置权限失败: {error}"))?;
+        .map_err(|error| format!("限制 Windows {label}权限失败: {error}"))?;
     if status.success() {
         Ok(())
     } else {
-        Err("限制 Windows VPN 临时配置权限失败，已停止连接".to_string())
+        Err(format!("限制 Windows {label}权限失败，已停止连接"))
     }
 }
 
 /** 过滤 cookie、会话材料和高噪声数据包日志。 */
 fn should_drop_log(vpn_type: VpnType, text: &str) -> bool {
     let lower = text.to_lowercase();
-    ["cookie:", "loaded password", "configuration password"]
-        .iter()
-        .any(|keyword| lower.contains(keyword))
+    [
+        "cookie:",
+        "loaded password",
+        "configuration password",
+        "client data saved to",
+        "client data file",
+    ]
+    .iter()
+    .any(|keyword| lower.contains(keyword))
         || (vpn_type == VpnType::Atrust
             && [
                 "given auth data",
@@ -1285,9 +1432,11 @@ fn is_mfa_prompt(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_valid_ipv4_cidr, should_drop_log, toml_escape, HelperState, PIPE_SECURITY_SDDL,
+        build_atrust_config, is_valid_ipv4_cidr, should_drop_log, toml_escape, HelperState,
+        PIPE_SECURITY_SDDL,
     };
-    use crate::vpn::VpnType;
+    use crate::vpn::{VpnConfig, VpnType};
+    use std::path::Path;
 
     /** 管道 ACL 必须同时保留本机身份限制与 Medium 完整性标签。 */
     #[test]
@@ -1313,9 +1462,35 @@ mod tests {
         assert_eq!(toml_escape("a\\b\"c\nd\r"), "a\\\\b\\\"c\\nd\\r");
     }
 
-    /** Fortinet 逐包传输日志不得进入管理员 helper 的持久队列。 */
+    /** aTrust 配置只引用受限客户端数据文件，不持久化 SID 或服务端资源。 */
     #[test]
-    fn drops_fortinet_packet_transport_logs() {
+    fn persists_only_atrust_client_auth_data() {
+        let config = VpnConfig {
+            enabled: true,
+            host: "vpn.example.edu".to_string(),
+            port: 443,
+            username: "alice".to_string(),
+            password: None,
+            save_password: false,
+            custom_routes: Vec::new(),
+        };
+        let toml = build_atrust_config(
+            &config,
+            "password",
+            Path::new(
+                r"C:\Users\alice\AppData\Roaming\cn.yuyan.swiftvpn\.runtime\atrust-client-data.json",
+            ),
+        );
+
+        assert!(toml.contains("client_data_file = \"C:\\\\Users\\\\alice"));
+        assert!(!toml.contains("resource_file"));
+        assert!(!toml.contains("sid ="));
+        assert!(!toml.contains("device_id ="));
+    }
+
+    /** 敏感客户端路径与 Fortinet 逐包日志不得进入管理员 helper 的持久队列。 */
+    #[test]
+    fn drops_sensitive_or_noisy_helper_logs() {
         assert!(should_drop_log(
             VpnType::Fortinet,
             "DEBUG: tun ---> gateway (128 bytes)"
@@ -1327,6 +1502,10 @@ mod tests {
         assert!(!should_drop_log(
             VpnType::Fortinet,
             "INFO: Tunnel is up and running."
+        ));
+        assert!(should_drop_log(
+            VpnType::Atrust,
+            r"Client data saved to C:\Users\alice\atrust-client-data.json"
         ));
     }
 
