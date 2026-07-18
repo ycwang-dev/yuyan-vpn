@@ -208,7 +208,9 @@ pub async fn refresh(app_handle: &AppHandle, manager: &VpnManager) -> Result<(),
     if !helper_is_available(manager).await {
         return Ok(());
     }
-    let response = request_with_session(manager, HelperCommand::Snapshot).await?;
+    let after_sequence = manager.inner.lock().await.windows_log_sequence;
+    let response =
+        request_with_session(manager, HelperCommand::Snapshot { after_sequence }).await?;
     apply_response(app_handle, manager, response).await
 }
 

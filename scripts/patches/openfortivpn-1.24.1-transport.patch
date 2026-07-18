@@ -1,0 +1,90 @@
+diff --git a/src/io.c b/src/io.c
+index 418b65c..4f6dfb8 100644
+--- a/src/io.c
++++ b/src/io.c
+@@ -262,8 +262,8 @@ static void *pppd_read(void *arg)
+ 			packet = repacket;
+ 			packet->len = pktsize;
+ 
+-			log_debug("%s ---> gateway (%lu bytes)\n", PPP_DAEMON,
+-			          packet->len);
++			log_debug_all("%s ---> gateway (%lu bytes)\n", PPP_DAEMON,
++			              packet->len);
+ #if HAVE_USR_SBIN_PPPD
+ 			log_packet("pppd:   ", packet->len, pkt_data(packet));
+ #else
+@@ -492,7 +492,7 @@ static void *ssl_read(void *arg)
+ 			break;
+ 		}
+ 
+-		log_debug("gateway ---> %s (%lu bytes)\n", PPP_DAEMON, packet->len);
++		log_debug_all("gateway ---> %s (%lu bytes)\n", PPP_DAEMON, packet->len);
+ 		log_packet("gtw:    ", packet->len, pkt_data(packet));
+ 
+ 		if (tunnel->state == STATE_CONNECTING) {
+diff --git a/src/main.c b/src/main.c
+index 353a282..d0ea512 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -763,13 +763,18 @@ int main(int argc, char **argv)
+ 	}
+ 
+ 	do {
+-		if (run_tunnel(&cfg) != 0)
++		ret = run_tunnel(&cfg);
++		if (ret != 0)
+ 			ret = EXIT_FAILURE;
+ 		else
+ 			ret = EXIT_SUCCESS;
+-		if ((cfg.persistent > 0) && (get_sig_received() == 0))
++		if ((cfg.persistent > 0) && (get_sig_received() == 0)
++		    && (ret == EXIT_SUCCESS)) {
++			log_info("Tunnel ended; reconnecting in %u seconds.\n", cfg.persistent);
+ 			sleep(cfg.persistent);
+-	} while ((get_sig_received() == 0) && (cfg.persistent != 0));
++		}
++	} while ((get_sig_received() == 0) && (cfg.persistent != 0)
++	         && (ret == EXIT_SUCCESS));
+ 
+ 	goto exit;
+ 
+diff --git a/src/tunnel.c b/src/tunnel.c
+index a0a3f2f..bb0af8b 100644
+--- a/src/tunnel.c
++++ b/src/tunnel.c
+@@ -298,6 +298,8 @@ static int pppd_run(struct tunnel *tunnel)
+ 				"receive-all",
+ 				"nodefaultroute",
+ 				"nodetach",
++				"lcp-echo-interval", "25",
++				"lcp-echo-failure", "4",
+ 				"lcp-max-configure", "40",
+ 				"mru", "1354"
+ 			};
+@@ -1349,7 +1351,8 @@ err_tcp_connect:
+ 
+ int run_tunnel(struct vpn_config *config)
+ {
+-	int ret;
++	int ret;
++	int tunnel_established = 0;
+ 	struct tunnel tunnel = {
+ 		.config = config,
+ 		.state = STATE_DOWN,
+@@ -1435,6 +1438,7 @@ int run_tunnel(struct vpn_config *config)
+ 	tunnel.state = STATE_CONNECTING;
+ 
+ 	// Step 6: perform io between pppd and the gateway, while tunnel is up
++	tunnel_established = 1;
+ 	log_debug("Starting IO through the tunnel\n");
+ 	io_loop(&tunnel);
+ 
+@@ -1447,6 +1451,8 @@ int run_tunnel(struct vpn_config *config)
+ 
+ err_start_tunnel:
+ 	ret = pppd_terminate(&tunnel);
++	if (tunnel_established && get_sig_received() == 0)
++		ret = 0;
+ 	log_info("Terminated %s.\n", PPP_DAEMON);
+ err_tunnel:
+ 	log_info("Closed connection to gateway.\n");

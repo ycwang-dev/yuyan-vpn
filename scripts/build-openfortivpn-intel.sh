@@ -5,10 +5,26 @@ OPENFORTIVPN_VERSION="1.24.1"
 OPENFORTIVPN_COMMIT="a40a2d588733d48534eb78cd17b90142e5ba039b"
 OPENSSL_VERSION="3.6.2"
 OPENSSL_ARCHIVE_SHA256="aaf51a1fe064384f811daeaeb4ec4dce7340ec8bd893027eee676af31e83a04f"
-ARM_SIDECAR_SHA256="34b86b94cba093fbbfa829109ade986c072117f55d45d6d742695e7d0d89b019"
 REPOSITORY_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-OUTPUT_PATH=${1:-"$REPOSITORY_ROOT/src-tauri/binaries/openfortivpn-x86_64-apple-darwin"}
-WORK_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/openfortivpn-intel.XXXXXX")
+MACOS_ARCH=$(uname -m)
+case "$MACOS_ARCH" in
+  arm64)
+    OPENSSL_TARGET="darwin64-arm64-cc"
+    SIDECAR_SUFFIX="aarch64-apple-darwin"
+    EXPECTED_FILE_ARCH="arm64"
+    ;;
+  x86_64)
+    OPENSSL_TARGET="darwin64-x86_64-cc"
+    SIDECAR_SUFFIX="x86_64-apple-darwin"
+    EXPECTED_FILE_ARCH="x86_64"
+    ;;
+  *)
+    echo "不支持的 macOS 架构: $MACOS_ARCH" >&2
+    exit 1
+    ;;
+esac
+OUTPUT_PATH=${1:-"$REPOSITORY_ROOT/src-tauri/binaries/openfortivpn-$SIDECAR_SUFFIX"}
+WORK_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/openfortivpn-macos.XXXXXX")
 OPENFORTIVPN_SOURCE_DIRECTORY="$WORK_DIRECTORY/openfortivpn"
 OPENSSL_SOURCE_DIRECTORY="$WORK_DIRECTORY/openssl-$OPENSSL_VERSION"
 OPENSSL_INSTALL_DIRECTORY="$WORK_DIRECTORY/openssl-install"
@@ -50,13 +66,10 @@ clone_openfortivpn() {
   return 1
 }
 
-if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "x86_64" ]]; then
-  echo "Intel openfortivpn 只能在 x86_64 macOS runner 上构建" >&2
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "openfortivpn macOS sidecar 只能在 macOS runner 上构建" >&2
   exit 1
 fi
-
-ARM_SIDECAR="$REPOSITORY_ROOT/src-tauri/binaries/openfortivpn-aarch64-apple-darwin"
-echo "$ARM_SIDECAR_SHA256  $ARM_SIDECAR" | shasum -a 256 -c -
 
 if ! command -v autoconf >/dev/null || ! command -v automake >/dev/null || ! command -v pkg-config >/dev/null; then
   HOMEBREW_NO_AUTO_UPDATE=1 brew install autoconf automake pkg-config >"$WORK_DIRECTORY/homebrew-tools.log" 2>&1 || {
@@ -74,7 +87,7 @@ tar -xzf "$OPENSSL_ARCHIVE" -C "$WORK_DIRECTORY"
 
 export MACOSX_DEPLOYMENT_TARGET=12.0
 cd "$OPENSSL_SOURCE_DIRECTORY"
-run_logged openssl-configure ./Configure darwin64-x86_64-cc \
+run_logged openssl-configure ./Configure "$OPENSSL_TARGET" \
   no-shared \
   no-tests \
   --prefix="$OPENSSL_INSTALL_DIRECTORY" \
@@ -92,10 +105,12 @@ clone_openfortivpn
 test "$(git -C "$OPENFORTIVPN_SOURCE_DIRECTORY" rev-parse HEAD)" = "$OPENFORTIVPN_COMMIT"
 git -C "$OPENFORTIVPN_SOURCE_DIRECTORY" apply --check "$REPOSITORY_ROOT/scripts/patches/openfortivpn-1.24.1-http-status.patch"
 git -C "$OPENFORTIVPN_SOURCE_DIRECTORY" apply "$REPOSITORY_ROOT/scripts/patches/openfortivpn-1.24.1-http-status.patch"
-# 老式 FortiOS 门户返回 /remote/fortisslvpn_xml 404 时回退到 /remote/fortisslvpn 的 text6 分流路由，
-# 与 ARM 冻结的 1.18.0 原生行为、Windows 候选补丁保持一致，仅修改 x86_64 构建。
+# 老式 FortiOS 门户返回 /remote/fortisslvpn_xml 404 时回退到 /remote/fortisslvpn 的 text6 分流路由。
 git -C "$OPENFORTIVPN_SOURCE_DIRECTORY" apply --check "$REPOSITORY_ROOT/scripts/patches/openfortivpn-1.24.1-legacy-config.patch"
 git -C "$OPENFORTIVPN_SOURCE_DIRECTORY" apply "$REPOSITORY_ROOT/scripts/patches/openfortivpn-1.24.1-legacy-config.patch"
+# 降低逐包日志开销，启用 PPP 保活，并仅在已建立隧道意外结束后自动重连。
+git -C "$OPENFORTIVPN_SOURCE_DIRECTORY" apply --check "$REPOSITORY_ROOT/scripts/patches/openfortivpn-1.24.1-transport.patch"
+git -C "$OPENFORTIVPN_SOURCE_DIRECTORY" apply "$REPOSITORY_ROOT/scripts/patches/openfortivpn-1.24.1-transport.patch"
 
 cd "$OPENFORTIVPN_SOURCE_DIRECTORY"
 run_logged openfortivpn-autogen ./autogen.sh
@@ -106,13 +121,14 @@ run_logged openfortivpn-configure ./configure \
   --with-pppd=/usr/sbin/pppd
 run_logged openfortivpn-build make -s -j"$(sysctl -n hw.logicalcpu)"
 
-file openfortivpn | grep -q 'x86_64'
+file openfortivpn | grep -q "$EXPECTED_FILE_ARCH"
 test "$(./openfortivpn --version)" = "$OPENFORTIVPN_VERSION"
 grep -a -q 'stage: fortisslvpn_xml' openfortivpn
 grep -a -q 'Legacy FortiOS VPN configuration accepted' openfortivpn
+grep -a -q 'Tunnel ended; reconnecting' openfortivpn
 xcrun vtool -show-build openfortivpn | grep -q 'minos 12.0'
-if otool -L openfortivpn | grep -Eq '/(usr/local|opt/homebrew|Cellar|openfortivpn-intel)/'; then
-  echo "Intel openfortivpn 仍依赖 Homebrew 动态库，禁止进入安装包" >&2
+if otool -L openfortivpn | grep -Eq '/(usr/local|opt/homebrew|Cellar|openfortivpn-macos)/'; then
+  echo "openfortivpn 仍依赖 Homebrew 或临时目录动态库，禁止进入安装包" >&2
   otool -L openfortivpn >&2
   exit 1
 fi
@@ -121,4 +137,4 @@ mkdir -p "$(dirname "$OUTPUT_PATH")"
 cp openfortivpn "$OUTPUT_PATH"
 chmod 755 "$OUTPUT_PATH"
 shasum -a 256 "$OUTPUT_PATH"
-echo "Intel openfortivpn $OPENFORTIVPN_VERSION 构建与 macOS 12 兼容性校验通过"
+echo "openfortivpn $OPENFORTIVPN_VERSION ($MACOS_ARCH) 构建与 macOS 12 兼容性校验通过"

@@ -13,7 +13,7 @@ pub enum HelperCommand {
     ConnectAtrust { config: VpnConfig, password: String },
     Disconnect { vpn_type: VpnType },
     SubmitMfa { code: String },
-    Snapshot,
+    Snapshot { after_sequence: u64 },
     Shutdown,
 }
 
