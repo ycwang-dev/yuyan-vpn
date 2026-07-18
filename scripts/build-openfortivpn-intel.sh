@@ -23,7 +23,13 @@ case "$MACOS_ARCH" in
     exit 1
     ;;
 esac
-OUTPUT_PATH=${1:-"$REPOSITORY_ROOT/src-tauri/binaries/openfortivpn-$SIDECAR_SUFFIX"}
+if [[ $# -gt 0 && "$1" = /* ]]; then
+  OUTPUT_PATH="$1"
+elif [[ $# -gt 0 ]]; then
+  OUTPUT_PATH="$REPOSITORY_ROOT/$1"
+else
+  OUTPUT_PATH="$REPOSITORY_ROOT/src-tauri/binaries/openfortivpn-$SIDECAR_SUFFIX"
+fi
 WORK_DIRECTORY=$(mktemp -d "${TMPDIR:-/tmp}/openfortivpn-macos.XXXXXX")
 OPENFORTIVPN_SOURCE_DIRECTORY="$WORK_DIRECTORY/openfortivpn"
 OPENSSL_SOURCE_DIRECTORY="$WORK_DIRECTORY/openssl-$OPENSSL_VERSION"

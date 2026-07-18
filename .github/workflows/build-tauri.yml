@@ -356,7 +356,7 @@ jobs:
       - name: Build isolated macOS openfortivpn
         if: runner.os == 'macOS'
         shell: bash
-        run: ./scripts/build-openfortivpn-intel.sh "src-tauri/binaries/openfortivpn-${{ matrix.sidecar_suffix }}"
+        run: ./scripts/build-openfortivpn-intel.sh "$GITHUB_WORKSPACE/src-tauri/binaries/openfortivpn-${{ matrix.sidecar_suffix }}"
 
       - name: Normalize and Verify macOS Sidecars
         if: runner.os == 'macOS'
