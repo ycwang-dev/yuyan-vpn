@@ -7,6 +7,7 @@ use tauri::image::Image;
 use tauri::{Emitter, Manager};
 
 mod app_update;
+mod tray;
 mod vpn;
 
 /** Windows 主程序在创建 WebView 前尝试进入无界面的 UAC helper 模式。 */
@@ -178,6 +179,12 @@ fn exit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+/** 显示并聚焦主窗口，供前端全局托盘事件复用。 */
+#[tauri::command]
+fn show_main_window(app: tauri::AppHandle) {
+    tray::show_main_window(&app);
+}
+
 #[tauri::command]
 fn reveal_in_file_manager(path: String) -> Result<(), String> {
     println!("🔍 正在打开文件管理器定位文件: {}", path);
@@ -229,18 +236,23 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--hidden"]),
+        ))
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if args.iter().any(|argument| argument == "--hidden") {
+                return;
             }
+            tray::show_main_window(app);
+            let _ = app.emit("tray-navigate", serde_json::json!({ "path": "/dashboard" }));
         }))
         .invoke_handler(tauri::generate_handler![
             change_app_icon,
             app_update::prepare_app_update_install,
             app_update::cancel_app_update_install_preparation,
             exit_app,
+            show_main_window,
             reveal_in_file_manager,
             get_system_info,
             vpn::save_vpn_config,
@@ -256,8 +268,7 @@ pub fn run() {
         ])
         .on_window_event(|_window, event| {
             if let tauri::WindowEvent::CloseRequested { api: _api, .. } = event {
-                #[cfg(target_os = "macos")]
-                {
+                if _window.label() == "main" {
                     _api.prevent_close();
                     let _ = _window.hide();
                 }
@@ -265,6 +276,9 @@ pub fn run() {
         })
         .on_menu_event(|app_handle, event| {
             let event_id = event.id().as_ref();
+            if tray::handle_menu_event(app_handle, event_id) {
+                return;
+            }
             if event_id == "check-update" {
                 let _ = app_handle.emit("menu-check-update", ());
             } else if event_id == "about-yuyan" {
@@ -272,6 +286,8 @@ pub fn run() {
             }
         })
         .setup(move |_app| {
+            tray::setup(_app)?;
+
             #[cfg(target_os = "macos")]
             tauri::async_runtime::spawn(vpn::maintain_idle_network_state(network_recovery_manager));
 
@@ -302,6 +318,10 @@ pub fn run() {
                     }
                     let _ = _app.set_menu(menu);
                 }
+            }
+
+            if !tray::should_start_hidden() {
+                tray::show_main_window(_app.handle());
             }
 
             Ok(())

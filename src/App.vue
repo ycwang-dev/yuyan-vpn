@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref } from 'vue';
 import { useTheme } from '@/hooks/useTheme';
+import { useTrayIntegration } from '@/hooks/useTrayIntegration';
 import { isTauri } from '@/utils/env';
 import AppSplash from '@/components/AppSplash/index.vue';
 import zhCN from 'ant-design-vue/es/locale/zh_CN';
@@ -28,6 +29,7 @@ const shouldShowSplash = (): boolean => {
 };
 
 const { themeConfig } = useTheme();
+useTrayIntegration();
 const showSplash = ref(shouldShowSplash());
 </script>
 

@@ -3,6 +3,14 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { message } from 'ant-design-vue';
 import { useVpnLogs } from '@/hooks/useVpnLogs';
+import {
+  TRAY_VPN_ACTION_EVENT,
+  VPN_AUTH_FORWARD_EVENT,
+  VPN_CAPTCHA_FORWARD_EVENT,
+  type TrayVpnActionEventPayload,
+  type VpnAuthEventPayload,
+  type VpnCaptchaEventPayload,
+} from '@/hooks/useTrayIntegration';
 import { detectPlatform } from '@/utils/platformDetect';
 import { type VpnStats, VPN_TYPES } from '../constant';
 
@@ -338,11 +346,36 @@ export function useVpnDashboard() {
     await doDisconnectAll();
   };
 
-  let authUnlisten: (() => void) | null = null;
+  /** 继续执行由原生托盘发起且需要 macOS 授权的 VPN 动作。 */
+  const handleTrayVpnAction = (event: Event) => {
+    const payload = (event as CustomEvent<TrayVpnActionEventPayload>).detail;
+    if (!payload?.action) return;
+    void requestSystemAuthorization(payload.action);
+  };
+
+  /** 展示由 App 根级监听器转发的 aTrust 二次认证提示。 */
+  const handleForwardedAuth = (event: Event) => {
+    const payload = (event as CustomEvent<VpnAuthEventPayload>).detail;
+    if (payload?.vpnType !== 'Atrust') return;
+    mfaPrompt.value = payload.prompt || '请输入二次验证码';
+    mfaCodeInput.value = '';
+    mfaVisible.value = true;
+  };
+
+  /** 展示由 App 根级监听器转发的 aTrust 图形验证码。 */
+  const handleForwardedCaptcha = (event: Event) => {
+    const payload = (event as CustomEvent<VpnCaptchaEventPayload>).detail;
+    if (payload?.vpnType !== 'Atrust' || !payload.url) return;
+    captchaUrl.value = payload.url;
+    captchaVisible.value = true;
+  };
 
   onMounted(() => {
     void initLogListener();
     void fetchVpnStates();
+    window.addEventListener(TRAY_VPN_ACTION_EVENT, handleTrayVpnAction);
+    window.addEventListener(VPN_AUTH_FORWARD_EVENT, handleForwardedAuth);
+    window.addEventListener(VPN_CAPTCHA_FORWARD_EVENT, handleForwardedCaptcha);
 
     // 1. 定时状态拉取
     pollInterval = setInterval(fetchVpnStates, 3000);
@@ -379,27 +412,6 @@ export function useVpnDashboard() {
       statusUnlisten = unsub;
     });
 
-    // 监听二次认证验证码提示
-    listen('vpn-auth-required', (event: any) => {
-      const p: any = event.payload;
-      if (p.vpnType !== 'Atrust') return;
-      mfaPrompt.value = p.prompt || '请输入二次验证码';
-      mfaCodeInput.value = '';
-      mfaVisible.value = true;
-    }).then((unsub) => {
-      authUnlisten = unsub;
-    });
-
-    // 监听图形/滑动验证码 URL
-    listen('vpn-captcha-required', (event: any) => {
-      const p: any = event.payload;
-      if (p.vpnType !== 'Atrust') return;
-      captchaUrl.value = p.url;
-      captchaVisible.value = true;
-    }).then((unsub) => {
-      captchaUnlisten = unsub;
-    });
-
     // 3. 前端时长计时累加器
     uptimeInterval = setInterval(() => {
       if (fortinetState.value.status === 'connected') {
@@ -411,14 +423,13 @@ export function useVpnDashboard() {
     }, 1000);
   });
 
-  let captchaUnlisten: (() => void) | null = null;
-
   onUnmounted(() => {
     if (pollInterval) clearInterval(pollInterval);
     if (uptimeInterval) clearInterval(uptimeInterval);
     if (statusUnlisten) statusUnlisten();
-    if (authUnlisten) authUnlisten();
-    if (captchaUnlisten) captchaUnlisten();
+    window.removeEventListener(TRAY_VPN_ACTION_EVENT, handleTrayVpnAction);
+    window.removeEventListener(VPN_AUTH_FORWARD_EVENT, handleForwardedAuth);
+    window.removeEventListener(VPN_CAPTCHA_FORWARD_EVENT, handleForwardedCaptcha);
   });
 
   return {
