@@ -4,9 +4,9 @@
   "version": "1.0.18",
   "identifier": "cn.yuyan.swiftvpn",
   "build": {
-    "beforeDevCommand": "pnpm run frontend:dev",
+    "beforeDevCommand": "pnpm run app:dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "pnpm run frontend:build",
+    "beforeBuildCommand": "pnpm run app:build",
     "frontendDist": "../dist"
   },
   "app": {

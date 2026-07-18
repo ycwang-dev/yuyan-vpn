@@ -7,9 +7,13 @@
   "scripts": {
     "dev": "tauri dev",
     "build": "tauri build",
+    "app:prepare": "node scripts/prepare-macos-openfortivpn.js",
+    "app:dev": "pnpm run app:prepare && pnpm run frontend:dev",
+    "app:build": "pnpm run app:prepare && pnpm run frontend:build",
     "frontend:dev": "vite --host 127.0.0.1 --port 1420",
     "frontend:build": "vue-tsc --noEmit && vite build",
     "frontend:build:ci": "vite build",
+    "test:sidecar-prepare": "node --test scripts/prepare-macos-openfortivpn.test.js",
     "test:update-manifest": "node --test scripts/generate-update-manifest.test.js",
     "typecheck": "vue-tsc --noEmit",
     "tauri": "tauri"

@@ -1,8 +1,58 @@
 diff --git a/src/io.c b/src/io.c
-index 418b65c..4f6dfb8 100644
+index ac16212..2443207 100644
 --- a/src/io.c
 +++ b/src/io.c
-@@ -262,8 +262,8 @@ static void *pppd_read(void *arg)
+@@ -178,6 +178,41 @@ static os_semaphore_t sem_pppd_ready;
+ static os_semaphore_t sem_if_config;
+ static os_semaphore_t sem_stop_io;
+ 
++#define packet_is_lcp_echo_request(packet) \
++	((packet)->len >= 3 \
++	 && pkt_data(packet)[0] == 0xc0 \
++	 && pkt_data(packet)[1] == 0x21 \
++	 && pkt_data(packet)[2] == 0x09)
++
++#define packet_is_lcp_echo_reply(packet) \
++	((packet)->len >= 3 \
++	 && pkt_data(packet)[0] == 0xc0 \
++	 && pkt_data(packet)[1] == 0x21 \
++	 && pkt_data(packet)[2] == 0x0a)
++
++/** 记录 TLS 传输结束原因，并保留 OpenSSL 错误队列用于定位服务端主动断开。 */
++static void log_tls_transport_end(const char *operation, int error,
++                                  unsigned int lcp_echo_replies)
++{
++	unsigned long tls_error = ERR_peek_last_error();
++
++	if (error == ERR_TLS_SEE_ERRNO) {
++		log_warn("TLS transport ended while %s: %s (errno=%d); LCP echo replies=%u.\n",
++		         operation, err_ssl_str(error), errno, lcp_echo_replies);
++	} else if ((error == ERR_TLS_PROTOCOL || error == ERR_TLS_SEE_TLSERR)
++	           && tls_error != 0) {
++		char error_buffer[256];
++
++		ERR_error_string_n(tls_error, error_buffer, sizeof(error_buffer));
++		log_warn("TLS transport ended while %s: %s; OpenSSL=%s; LCP echo replies=%u.\n",
++		         operation, err_ssl_str(error), error_buffer,
++		         lcp_echo_replies);
++	} else {
++		log_warn("TLS transport ended while %s: %s; LCP echo replies=%u.\n",
++		         operation, err_ssl_str(error), lcp_echo_replies);
++	}
++}
++
+ /*
+  * Thread to read bytes from the pppd pty, convert them to ppp packets and add
+  * them to the 'pty_to_ssl' pool.
+@@ -187,6 +222,7 @@ static void *pppd_read(void *arg)
+ 	struct tunnel *tunnel = (struct tunnel *) arg;
+ 	uint8_t buf[PKT_BUF_SZ];
+ 	int first_time = 1;
++	unsigned int lcp_echo_requests = 0;
+ 	off_t off_r, off_w;
+ 	fd_set read_fd;
+ 
+@@ -262,8 +298,14 @@ static void *pppd_read(void *arg)
  			packet = repacket;
  			packet->len = pktsize;
  
@@ -10,23 +60,63 @@ index 418b65c..4f6dfb8 100644
 -			          packet->len);
 +			log_debug_all("%s ---> gateway (%lu bytes)\n", PPP_DAEMON,
 +			              packet->len);
++			if (packet_is_lcp_echo_request(packet)) {
++				lcp_echo_requests++;
++				if (lcp_echo_requests == 1 || lcp_echo_requests % 12 == 0)
++					log_debug("PPP keepalive active: forwarded %u LCP echo requests.\n",
++					          lcp_echo_requests);
++			}
  #if HAVE_USR_SBIN_PPPD
  			log_packet("pppd:   ", packet->len, pkt_data(packet));
  #else
-@@ -492,7 +492,7 @@ static void *ssl_read(void *arg)
+@@ -436,6 +478,7 @@ static void debug_bad_packet(struct tunnel *tunnel, uint8_t *header)
+ static void *ssl_read(void *arg)
+ {
+ 	struct tunnel *tunnel = (struct tunnel *) arg;
++	unsigned int lcp_echo_replies = 0;
+ 	//uint8_t buf[PKT_BUF_SZ];
+ 
+ 	log_debug("%s thread\n", __func__);
+@@ -449,8 +492,8 @@ static void *ssl_read(void *arg)
+ 
+ 		ret = safe_ssl_read_all(tunnel->ssl_handle, header, 6);
+ 		if (ret < 0) {
+-			log_debug("Error reading from TLS connection (%s).\n",
+-			          err_ssl_str(ret));
++			log_tls_transport_end("reading packet header", ret,
++			                      lcp_echo_replies);
+ 			break;
+ 		}
+ 
+@@ -486,14 +529,20 @@ static void *ssl_read(void *arg)
+ 		ret = safe_ssl_read_all(tunnel->ssl_handle, pkt_data(packet),
+ 		                        size);
+ 		if (ret < 0) {
+-			log_debug("Error reading from TLS connection (%s).\n",
+-			          err_ssl_str(ret));
++			log_tls_transport_end("reading packet payload", ret,
++			                      lcp_echo_replies);
+ 			free(packet);
  			break;
  		}
  
 -		log_debug("gateway ---> %s (%lu bytes)\n", PPP_DAEMON, packet->len);
 +		log_debug_all("gateway ---> %s (%lu bytes)\n", PPP_DAEMON, packet->len);
  		log_packet("gtw:    ", packet->len, pkt_data(packet));
++		if (packet_is_lcp_echo_reply(packet)) {
++			lcp_echo_replies++;
++			if (lcp_echo_replies == 1 || lcp_echo_replies % 12 == 0)
++				log_debug("PPP keepalive confirmed: received %u LCP echo replies.\n",
++				          lcp_echo_replies);
++		}
  
  		if (tunnel->state == STATE_CONNECTING) {
+ 			if (packet_is_ip_plus_dns(packet)) {
 diff --git a/src/main.c b/src/main.c
-index 353a282..d0ea512 100644
+index fe265d7..35b1a07 100644
 --- a/src/main.c
 +++ b/src/main.c
-@@ -763,13 +763,18 @@ int main(int argc, char **argv)
+@@ -764,13 +764,18 @@ int main(int argc, char *argv[])
  	}
  
  	do {
@@ -49,10 +139,61 @@ index 353a282..d0ea512 100644
  	goto exit;
  
 diff --git a/src/tunnel.c b/src/tunnel.c
-index a0a3f2f..bb0af8b 100644
+index 48ec196..a56e875 100644
 --- a/src/tunnel.c
 +++ b/src/tunnel.c
-@@ -298,6 +298,8 @@ static int pppd_run(struct tunnel *tunnel)
+@@ -77,6 +77,50 @@ struct ofv_varr {
+ 	const char **data;	// NULL terminated
+ };
+ 
++#define YUYAN_TCP_KEEPALIVE_IDLE_SECONDS 30
++#define YUYAN_TCP_KEEPALIVE_INTERVAL_SECONDS 10
++#define YUYAN_TCP_KEEPALIVE_PROBES 4
++
++/** 启用内核 TCP 保活，降低 NAT、TUN 重载和短时断网造成的半开连接风险。 */
++static void configure_tcp_keepalive(int handle)
++{
++	const int enabled = 1;
++	const int idle = YUYAN_TCP_KEEPALIVE_IDLE_SECONDS;
++	const int interval = YUYAN_TCP_KEEPALIVE_INTERVAL_SECONDS;
++	const int probes = YUYAN_TCP_KEEPALIVE_PROBES;
++
++	if (setsockopt(handle, SOL_SOCKET, SO_KEEPALIVE,
++	               (const char *) &enabled, sizeof(enabled))) {
++		log_warn("setsockopt SO_KEEPALIVE: %s\n", strerror(errno));
++		return;
++	}
++
++#if defined(TCP_KEEPALIVE)
++	if (setsockopt(handle, IPPROTO_TCP, TCP_KEEPALIVE,
++	               (const char *) &idle, sizeof(idle)))
++		log_warn("setsockopt TCP_KEEPALIVE: %s\n", strerror(errno));
++#elif defined(TCP_KEEPIDLE)
++	if (setsockopt(handle, IPPROTO_TCP, TCP_KEEPIDLE,
++	               (const char *) &idle, sizeof(idle)))
++		log_warn("setsockopt TCP_KEEPIDLE: %s\n", strerror(errno));
++#endif
++
++#if defined(TCP_KEEPINTVL)
++	if (setsockopt(handle, IPPROTO_TCP, TCP_KEEPINTVL,
++	               (const char *) &interval, sizeof(interval)))
++		log_warn("setsockopt TCP_KEEPINTVL: %s\n", strerror(errno));
++#endif
++
++#if defined(TCP_KEEPCNT)
++	if (setsockopt(handle, IPPROTO_TCP, TCP_KEEPCNT,
++	               (const char *) &probes, sizeof(probes)))
++		log_warn("setsockopt TCP_KEEPCNT: %s\n", strerror(errno));
++#endif
++
++	log_info("TCP keepalive enabled: idle=%ds, interval=%ds, probes=%d.\n",
++	         idle, interval, probes);
++}
++
+ static int ofv_append_varr(struct ofv_varr *p, const char *x)
+ {
+ 	if (p->off + 1 >= p->cap) {
+@@ -298,6 +342,8 @@ static int pppd_run(struct tunnel *tunnel)
  				"receive-all",
  				"nodefaultroute",
  				"nodetach",
@@ -61,17 +202,23 @@ index a0a3f2f..bb0af8b 100644
  				"lcp-max-configure", "40",
  				"mru", "1354"
  			};
-@@ -1349,7 +1351,8 @@ err_tcp_connect:
+@@ -654,6 +700,7 @@ static int tcp_connect(struct tunnel *tunnel)
+ 		log_error("socket: %s\n", strerror(errno));
+ 		goto err_socket;
+ 	}
++	configure_tcp_keepalive(handle);
  
+ 	if (iface_len == IF_NAMESIZE) {
+ 		log_error("socket: Too long iface name\n");
+@@ -1350,6 +1397,7 @@ err_tcp_connect:
  int run_tunnel(struct vpn_config *config)
  {
--	int ret;
-+	int ret;
+ 	int ret;
 +	int tunnel_established = 0;
  	struct tunnel tunnel = {
  		.config = config,
  		.state = STATE_DOWN,
-@@ -1435,6 +1438,7 @@ int run_tunnel(struct vpn_config *config)
+@@ -1435,6 +1483,7 @@ int run_tunnel(struct vpn_config *config)
  	tunnel.state = STATE_CONNECTING;
  
  	// Step 6: perform io between pppd and the gateway, while tunnel is up
@@ -79,7 +226,7 @@ index a0a3f2f..bb0af8b 100644
  	log_debug("Starting IO through the tunnel\n");
  	io_loop(&tunnel);
  
-@@ -1447,6 +1451,8 @@ int run_tunnel(struct vpn_config *config)
+@@ -1447,6 +1496,8 @@ int run_tunnel(struct vpn_config *config)
  
  err_start_tunnel:
  	ret = pppd_terminate(&tunnel);
