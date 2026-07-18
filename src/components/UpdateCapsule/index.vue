@@ -1,64 +1,90 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import { useAppUpdate } from './hooks/useAppUpdate';
 import { STATUS_CONFIG_MAP } from './constant';
-import './style.less';
 
 defineOptions({ name: 'UpdateCapsule' });
 
 const {
   hasUpdate,
   updateState,
-  updatePercent,
+  latestVersion,
+  updateLogs,
   handleCapsuleClick,
 } = useAppUpdate();
 
-/** 当前状态对应的配置 */
+/** 更新说明确认层是否展开。 */
+const popoverOpen = ref(false);
+
+/** 当前状态对应的胶囊配置。 */
 const config = computed(() => STATUS_CONFIG_MAP[updateState.value.status]);
 
-/** 将字节速度格式化为易读文本。 */
-const formattedSpeed = computed(() => {
-  const bytes = updateState.value.bytesPerSecond;
-  if (!bytes) return '正在连接';
-  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB/s`;
-  return `${Math.max(1, Math.round(bytes / 1024))} KB/s`;
+/** 带统一 `v` 前缀的版本号。 */
+const versionLabel = computed(() => {
+  if (!latestVersion.value) return '';
+  return latestVersion.value.startsWith('v')
+    ? latestVersion.value
+    : `v${latestVersion.value}`;
 });
 
-/** 下载进度辅助说明。 */
-const downloadDetail = computed(() => {
-  const remaining = updateState.value.remainingSeconds;
-  const parts = [formattedSpeed.value];
-  if (remaining !== null) parts.push(`约 ${remaining} 秒`);
-  return parts.join(' · ');
+/** 胶囊只表达用户当前可执行的安装动作。 */
+const capsuleLabel = computed(() => {
+  if (updateState.value.status === 'completed' && latestVersion.value) {
+    return `${versionLabel.value} 已就绪，点击安装`;
+  }
+  return config.value.label;
 });
+
+/** 支持键盘打开或关闭更新说明确认层。 */
+const handleKeydown = (event: KeyboardEvent) => {
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  event.preventDefault();
+  popoverOpen.value = !popoverOpen.value;
+};
+
+/** 用户查看更新说明后确认安装。 */
+const confirmInstall = () => {
+  popoverOpen.value = false;
+  handleCapsuleClick();
+};
 </script>
 
 <template>
-  <div
+  <a-popover
     v-if="hasUpdate"
-    class="update-capsule"
-    :class="config.className"
-    @click="handleCapsuleClick"
+    v-model:open="popoverOpen"
+    trigger="click"
+    placement="bottomLeft"
   >
-    <!-- 🔮 3D 玻璃反射光泽层 -->
-    <div class="glass-glare"></div>
-
-    <!-- 🔮 3D LED 物理状态指示灯 -->
-    <span class="capsule-led"></span>
-
-    <!-- 左侧图标 -->
-    <component :is="config.icon" class="capsule-icon" />
-
-    <!-- 进度数字（下载中） -->
-    <template v-if="updateState.status === 'downloading'">
-      <span v-if="updatePercent > 0 && updatePercent < 100" class="progress-text">
-        {{ updatePercent }}% · {{ downloadDetail }}
-      </span>
-      <span v-else class="capsule-label">{{ config.label }}</span>
-      <div class="progress-bar-bg" :style="{ width: `${updatePercent}%` }"></div>
+    <template #content>
+      <div class="update-ready-panel">
+        <div class="update-ready-title">新版本 {{ versionLabel }} 已准备完成</div>
+        <div class="update-ready-hint">确认后将安全断开 VPN、安装更新并重启</div>
+        <div class="update-ready-logs">{{ updateLogs }}</div>
+        <div class="update-ready-actions">
+          <a-button size="small" @click="popoverOpen = false">稍后</a-button>
+          <a-button type="primary" size="small" @click="confirmInstall">立即安装</a-button>
+        </div>
+      </div>
     </template>
 
-    <!-- 其他状态文案 -->
-    <span v-else class="capsule-label">{{ config.label }}</span>
-  </div>
+    <div
+      class="update-capsule"
+      :class="config.className"
+      role="button"
+      tabindex="0"
+      :aria-label="capsuleLabel"
+      :aria-expanded="popoverOpen"
+      @keydown="handleKeydown"
+    >
+      <div class="glass-glare"></div>
+      <span class="capsule-led"></span>
+      <component :is="config.icon" class="capsule-icon" />
+      <span class="capsule-label">{{ capsuleLabel }}</span>
+    </div>
+  </a-popover>
 </template>
+
+<style scoped lang="less">
+@import './style.less';
+</style>

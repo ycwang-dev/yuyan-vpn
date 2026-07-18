@@ -55,7 +55,7 @@ export const STATUS_CONFIG_MAP: Record<UpdateStatus, CapsuleConfig> = {
   },
   completed: {
     icon: ThunderboltOutlined,
-    label: '✨ 更新已就绪，点击重启',
+    label: '新版本已就绪，点击安装',
     clickable: true,
     className: 'status-completed',
   },
@@ -78,3 +78,10 @@ export const AUTO_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 /** 首次启动延迟检测（毫秒） */
 export const INITIAL_CHECK_DELAY_MS = 2000;
+
+/** 静默下载失败后的阶梯重试间隔（毫秒） */
+export const SILENT_DOWNLOAD_RETRY_DELAYS_MS = [
+  60 * 1000,
+  5 * 60 * 1000,
+  15 * 60 * 1000,
+] as const;
