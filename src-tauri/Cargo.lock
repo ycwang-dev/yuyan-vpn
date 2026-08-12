@@ -5705,7 +5705,7 @@ dependencies = [
 
 [[package]]
 name = "yuyan-swift-vpn"
-version = "1.0.19"
+version = "1.0.20"
 dependencies = [
  "cocoa",
  "getrandom 0.3.4",
