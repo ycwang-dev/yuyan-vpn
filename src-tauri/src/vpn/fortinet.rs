@@ -11,6 +11,7 @@ use std::collections::HashSet;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -18,6 +19,14 @@ use tokio::sync::Mutex;
 
 #[cfg(target_os = "macos")]
 const EXPECTED_MACOS_OPENFORTIVPN_VERSION: &str = "1.24.1";
+
+/**
+ * FortiGate 偶发在认证成功后立即重置首个会话（网关侧旧会话清理竞态），
+ * 引擎会在隧道建立前退出。凭据已验证通过，自动重试不会触发账号锁定。
+ */
+const FORTINET_MAX_AUTO_RETRIES: u32 = 2;
+/** 自动重试前等待网关清理上一个半开会话的时间。 */
+const FORTINET_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /** 创建仅限当前用户读取的 Fortinet 临时配置文件。 */
 fn write_secure_config(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
@@ -606,15 +615,148 @@ fn emit_status(
     );
 }
 
-/** 读取并转发 openfortivpn 的单路日志。 */
-async fn forward_logs<R>(reader: R, app_handle: AppHandle)
+/** 单次引擎运行期间从日志提取的连接进度信号，用于判断失败后能否安全自动重试。 */
+#[derive(Default)]
+struct FortinetAttemptSignals {
+    authenticated: AtomicBool,
+    tunnel_up: AtomicBool,
+}
+
+impl FortinetAttemptSignals {
+    /** 识别认证成功与隧道建立的关键日志行。 */
+    fn record(&self, text: &str) {
+        if text.contains("Authenticated.") || text.contains("Remote gateway has allocated a VPN") {
+            self.authenticated.store(true, Ordering::Relaxed);
+        }
+        if text.contains("Tunnel is up and running") {
+            self.tunnel_up.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/** 读取并转发 openfortivpn 的单路日志，同时记录连接进度信号。 */
+async fn forward_logs<R>(reader: R, app_handle: AppHandle, signals: Arc<FortinetAttemptSignals>)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(text)) = lines.next_line().await {
+        signals.record(&text);
         emit_vpn_log(&app_handle, VpnType::Fortinet, text);
     }
+}
+
+/** Fortinet 引擎单次拉起后的进程句柄、日志流与一次性配置路径。 */
+struct FortinetEngineLaunch {
+    child: tokio::process::Child,
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
+    config_path: std::path::PathBuf,
+}
+
+/** 写入一次性配置并拉起 openfortivpn；任一步失败时回收本次进程与临时配置。 */
+async fn launch_fortinet_engine(
+    openfortivpn_bin: &std::path::Path,
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+    sudo_password: &str,
+) -> Result<FortinetEngineLaunch, String> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let config_path = std::env::temp_dir().join(format!("openfortivpn-{timestamp}.conf"));
+    let config = format!(
+        "host = {host}\nport = {port}\nusername = {username}\npassword = {password}\ntrusted-cert = 491a5bbe4cc44c3e42141d9babfbdd29eee75aaf36401221a1dac9305c846b56\ninsecure-ssl = 1\n"
+    );
+    if let Err(error) = write_secure_config(&config_path, config.as_bytes()) {
+        return Err(format!("写入 Fortinet 临时配置失败: {error}"));
+    }
+
+    let mut command = tokio::process::Command::new("sudo");
+    command
+        .arg("-S")
+        .arg("-p")
+        .arg("")
+        .arg(openfortivpn_bin)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("--no-routes")
+        .arg("--no-dns")
+        .arg("--pppd-no-peerdns")
+        .arg("--persistent=3")
+        .arg("--min-tls=1.0")
+        .arg("--cipher-list=DHE-RSA-AES256-SHA:@SECLEVEL=0")
+        .arg("-v")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = std::fs::remove_file(&config_path);
+            return Err(format!("无法拉起内置 openfortivpn: {error}"));
+        }
+    };
+
+    let stdin_result = match child.stdin.take() {
+        Some(mut stdin) => {
+            stdin
+                .write_all(format!("{sudo_password}\n").as_bytes())
+                .await
+        }
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "无法打开 openfortivpn stdin",
+        )),
+    };
+    if let Err(error) = stdin_result {
+        if let Some(process_id) = child.id() {
+            terminate_managed_process_group(sudo_password, process_id).await;
+        }
+        let _ = child.kill().await;
+        let _ = std::fs::remove_file(&config_path);
+        return Err(format!("向 sudo 写入凭据失败: {error}"));
+    }
+
+    let (stdout, stderr) = match (child.stdout.take(), child.stderr.take()) {
+        (Some(stdout), Some(stderr)) => (stdout, stderr),
+        _ => {
+            if let Some(process_id) = child.id() {
+                terminate_managed_process_group(sudo_password, process_id).await;
+            }
+            let _ = child.kill().await;
+            let _ = std::fs::remove_file(&config_path);
+            return Err("无法读取内置 openfortivpn 日志".to_string());
+        }
+    };
+
+    Ok(FortinetEngineLaunch {
+        child,
+        stdout,
+        stderr,
+        config_path,
+    })
+}
+
+/** 引擎读取配置后延迟删除包含凭据的一次性文件，并同步清理 manager 记录。 */
+fn schedule_config_removal(
+    manager: Arc<Mutex<VpnManagerInner>>,
+    config_path: std::path::PathBuf,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let _ = tokio::fs::remove_file(&config_path).await;
+        let mut inner = manager.lock().await;
+        if inner.fortinet_config_path.as_ref() == Some(&config_path) {
+            inner.fortinet_config_path = None;
+        }
+    });
 }
 
 /** 等待本次 openfortivpn 创建或重建 PPP 接口并取得有效 IPv4。 */
@@ -970,15 +1112,7 @@ pub async fn connect_fortinet(
         };
         state.inner.lock().await.fortinet_mihomo_state = mihomo_state;
 
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let temp_config_path = std::env::temp_dir().join(format!("openfortivpn-{timestamp}.conf"));
-        let config = format!(
-        "host = {host}\nport = {port}\nusername = {username}\npassword = {password}\ntrusted-cert = 491a5bbe4cc44c3e42141d9babfbdd29eee75aaf36401221a1dac9305c846b56\ninsecure-ssl = 1\n"
-    );
-        if let Err(error) = write_secure_config(&temp_config_path, config.as_bytes()) {
+        if let Err(error) = state.inner().ensure_connections_allowed() {
             if let Some(route_target) = gateway_route_target.as_ref() {
                 remove_gateway_route(&sudo_password, route_target).await;
             }
@@ -986,113 +1120,38 @@ pub async fn connect_fortinet(
             let mihomo_state = state.inner.lock().await.fortinet_mihomo_state.take();
             restore_mihomo_interface(mihomo_state).await;
             mark_start_error(&state).await;
-            return Err(format!("写入 Fortinet 临时配置失败: {error}"));
-        }
-        state.inner.lock().await.fortinet_config_path = Some(temp_config_path.clone());
-
-        if let Err(error) = state.inner().ensure_connections_allowed() {
-            let _ = std::fs::remove_file(&temp_config_path);
-            state.inner.lock().await.fortinet_config_path = None;
-            if let Some(route_target) = gateway_route_target.as_ref() {
-                remove_gateway_route(&sudo_password, route_target).await;
-            }
-            let mihomo_state = state.inner.lock().await.fortinet_mihomo_state.take();
-            restore_mihomo_interface(mihomo_state).await;
-            mark_start_error(&state).await;
             return Err(error);
         }
 
-        let mut command = tokio::process::Command::new("sudo");
-        command
-            .arg("-S")
-            .arg("-p")
-            .arg("")
-            .arg(&openfortivpn_bin)
-            .arg("-c")
-            .arg(&temp_config_path)
-            .arg("--no-routes")
-            .arg("--no-dns")
-            .arg("--pppd-no-peerdns")
-            .arg("--persistent=3")
-            .arg("--min-tls=1.0")
-            .arg("--cipher-list=DHE-RSA-AES256-SHA:@SECLEVEL=0")
-            .arg("-v")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        command.process_group(0);
-
-        let mut child = match command.spawn() {
-            Ok(child) => child,
+        let launch = match launch_fortinet_engine(
+            &openfortivpn_bin,
+            &host,
+            port,
+            &username,
+            &password,
+            &sudo_password,
+        )
+        .await
+        {
+            Ok(launch) => launch,
             Err(error) => {
-                let _ = std::fs::remove_file(&temp_config_path);
-                state.inner.lock().await.fortinet_config_path = None;
                 if let Some(route_target) = gateway_route_target.as_ref() {
                     remove_gateway_route(&sudo_password, route_target).await;
                 }
+                state.inner.lock().await.fortinet_gateway_host = None;
                 let mihomo_state = state.inner.lock().await.fortinet_mihomo_state.take();
                 restore_mihomo_interface(mihomo_state).await;
                 mark_start_error(&state).await;
-                return Err(format!("无法拉起内置 openfortivpn: {error}"));
+                return Err(error);
             }
         };
-
-        if let Err(error) = state.inner().ensure_connections_allowed() {
-            if let Some(process_id) = child.id() {
-                terminate_managed_process_group(&sudo_password, process_id).await;
-            }
-            let _ = child.kill().await;
-            let _ = std::fs::remove_file(&temp_config_path);
-            state.inner.lock().await.fortinet_config_path = None;
-            if let Some(route_target) = gateway_route_target.as_ref() {
-                remove_gateway_route(&sudo_password, route_target).await;
-            }
-            let mihomo_state = state.inner.lock().await.fortinet_mihomo_state.take();
-            restore_mihomo_interface(mihomo_state).await;
-            mark_start_error(&state).await;
-            return Err(error);
-        }
-
-        let stdin_result = match child.stdin.take() {
-            Some(mut stdin) => {
-                stdin
-                    .write_all(format!("{sudo_password}\n").as_bytes())
-                    .await
-            }
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "无法打开 openfortivpn stdin",
-            )),
-        };
-        if let Err(error) = stdin_result {
-            let _ = child.kill().await;
-            let _ = std::fs::remove_file(&temp_config_path);
-            state.inner.lock().await.fortinet_config_path = None;
-            if let Some(route_target) = gateway_route_target.as_ref() {
-                remove_gateway_route(&sudo_password, route_target).await;
-            }
-            let mihomo_state = state.inner.lock().await.fortinet_mihomo_state.take();
-            restore_mihomo_interface(mihomo_state).await;
-            mark_start_error(&state).await;
-            return Err(format!("向 sudo 写入凭据失败: {error}"));
-        }
-
-        let (stdout, stderr) = match (child.stdout.take(), child.stderr.take()) {
-            (Some(stdout), Some(stderr)) => (stdout, stderr),
-            _ => {
-                let _ = child.kill().await;
-                let _ = std::fs::remove_file(&temp_config_path);
-                state.inner.lock().await.fortinet_config_path = None;
-                if let Some(route_target) = gateway_route_target.as_ref() {
-                    remove_gateway_route(&sudo_password, route_target).await;
-                }
-                let mihomo_state = state.inner.lock().await.fortinet_mihomo_state.take();
-                restore_mihomo_interface(mihomo_state).await;
-                mark_start_error(&state).await;
-                return Err("无法读取内置 openfortivpn 日志".to_string());
-            }
-        };
+        let FortinetEngineLaunch {
+            child,
+            stdout,
+            stderr,
+            config_path: temp_config_path,
+        } = launch;
+        state.inner.lock().await.fortinet_config_path = Some(temp_config_path.clone());
 
         let network_watcher = tokio::spawn(maintain_split_network(
             sudo_password.clone(),
@@ -1107,54 +1166,155 @@ pub async fn connect_fortinet(
         let manager = state.inner.clone();
         let watcher_app = app_handle.clone();
         let cleanup_password = sudo_password.clone();
-        let temp_config_cleanup = temp_config_path.clone();
+        let engine_binary = openfortivpn_bin.clone();
+        let engine_host = host.clone();
+        let engine_username = username.clone();
+        let engine_password = password.clone();
+        let first_config_path = temp_config_path.clone();
         let watcher = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            let _ = tokio::fs::remove_file(&temp_config_cleanup).await;
-            {
-                let mut inner = manager.lock().await;
-                if inner.fortinet_config_path.as_ref() == Some(&temp_config_cleanup) {
-                    inner.fortinet_config_path = None;
+            let mut engine_stdout = stdout;
+            let mut engine_stderr = stderr;
+            let mut current_config = first_config_path;
+            let mut failed_attempts: u32 = 0;
+            loop {
+                schedule_config_removal(manager.clone(), current_config.clone());
+
+                let signals = Arc::new(FortinetAttemptSignals::default());
+                tokio::join!(
+                    forward_logs(engine_stdout, watcher_app.clone(), signals.clone()),
+                    forward_logs(engine_stderr, watcher_app.clone(), signals.clone())
+                );
+
+                // 引擎进程已退出；决定自动重试还是最终收尾。
+                let status = manager.lock().await.fortinet_status;
+                let tunnel_seen =
+                    signals.tunnel_up.load(Ordering::Relaxed) || status == VpnStatus::Connected;
+                if tunnel_seen {
+                    // 隧道成功建立过，此后的中断视为新一轮故障，重置重试预算。
+                    failed_attempts = 0;
                 }
-            }
+                failed_attempts += 1;
+                let authenticated =
+                    tunnel_seen || signals.authenticated.load(Ordering::Relaxed);
 
-            tokio::join!(
-                forward_logs(stdout, watcher_app.clone()),
-                forward_logs(stderr, watcher_app.clone())
-            );
+                if matches!(status, VpnStatus::Connecting | VpnStatus::Connected)
+                    && authenticated
+                    && failed_attempts <= FORTINET_MAX_AUTO_RETRIES
+                {
+                    emit_vpn_log(
+                        &watcher_app,
+                        VpnType::Fortinet,
+                        format!(
+                            "Fortinet 引擎在隧道就绪前退出（网关重置旧会话），{} 秒后自动重试（第 {failed_attempts}/{FORTINET_MAX_AUTO_RETRIES} 次）",
+                            FORTINET_RETRY_DELAY.as_secs()
+                        ),
+                    );
+                    if status == VpnStatus::Connecting {
+                        emit_status(
+                            &watcher_app,
+                            VpnStatus::Connecting,
+                            "北京服务器 VPN 握手被网关重置，正在自动重试",
+                            None,
+                        );
+                    }
+                    tokio::time::sleep(FORTINET_RETRY_DELAY).await;
 
-            let (exit_status, gateway_host) = {
-                let mut inner = manager.lock().await;
-                let exit_status = if inner.fortinet_status == VpnStatus::Disconnecting {
-                    VpnStatus::Disconnected
-                } else {
-                    VpnStatus::Error
+                    let still_wanted = matches!(
+                        manager.lock().await.fortinet_status,
+                        VpnStatus::Connecting | VpnStatus::Connected
+                    );
+                    if still_wanted {
+                        match launch_fortinet_engine(
+                            &engine_binary,
+                            &engine_host,
+                            port,
+                            &engine_username,
+                            &engine_password,
+                            &cleanup_password,
+                        )
+                        .await
+                        {
+                            Ok(launch) => {
+                                let FortinetEngineLaunch {
+                                    mut child,
+                                    stdout,
+                                    stderr,
+                                    config_path,
+                                } = launch;
+                                let mut inner = manager.lock().await;
+                                if matches!(
+                                    inner.fortinet_status,
+                                    VpnStatus::Connecting | VpnStatus::Connected
+                                ) {
+                                    inner.fortinet_child = Some(child);
+                                    inner.fortinet_config_path = Some(config_path.clone());
+                                    drop(inner);
+                                    engine_stdout = stdout;
+                                    engine_stderr = stderr;
+                                    current_config = config_path;
+                                    continue;
+                                }
+                                drop(inner);
+                                // 用户在重试窗口内断开，回收刚拉起的引擎进程与配置。
+                                if let Some(process_id) = child.id() {
+                                    terminate_managed_process_group(
+                                        &cleanup_password,
+                                        process_id,
+                                    )
+                                    .await;
+                                }
+                                let _ = child.kill().await;
+                                let _ = tokio::fs::remove_file(&config_path).await;
+                            }
+                            Err(error) => {
+                                emit_vpn_log(
+                                    &watcher_app,
+                                    VpnType::Fortinet,
+                                    format!("自动重试拉起 Fortinet 引擎失败: {error}"),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // 用户断开、重试预算耗尽或不可重试的失败：执行最终清理。
+                let (exit_status, gateway_host) = {
+                    let mut inner = manager.lock().await;
+                    let exit_status = if matches!(
+                        inner.fortinet_status,
+                        VpnStatus::Disconnecting | VpnStatus::Disconnected
+                    ) {
+                        VpnStatus::Disconnected
+                    } else {
+                        VpnStatus::Error
+                    };
+                    inner.fortinet_status = exit_status;
+                    inner.fortinet_ip = None;
+                    inner.fortinet_start_time = None;
+                    inner.fortinet_child = None;
+                    if let Some(network_watcher) = inner.fortinet_network_watcher.take() {
+                        network_watcher.abort();
+                    }
+                    (exit_status, inner.fortinet_gateway_host.take())
                 };
-                inner.fortinet_status = exit_status;
-                inner.fortinet_ip = None;
-                inner.fortinet_start_time = None;
-                inner.fortinet_child = None;
-                if let Some(network_watcher) = inner.fortinet_network_watcher.take() {
-                    network_watcher.abort();
-                }
-                (exit_status, inner.fortinet_gateway_host.take())
-            };
 
-            if let Some(gateway_host) = gateway_host {
-                remove_gateway_route(&cleanup_password, &gateway_host).await;
+                if let Some(gateway_host) = gateway_host {
+                    remove_gateway_route(&cleanup_password, &gateway_host).await;
+                }
+                let mihomo_state = manager.lock().await.fortinet_mihomo_state.take();
+                restore_mihomo_interface(mihomo_state).await;
+                emit_status(
+                    &watcher_app,
+                    exit_status,
+                    if exit_status == VpnStatus::Error {
+                        "北京服务器 VPN 进程意外退出，请检查日志"
+                    } else {
+                        "已断开"
+                    },
+                    None,
+                );
+                break;
             }
-            let mihomo_state = manager.lock().await.fortinet_mihomo_state.take();
-            restore_mihomo_interface(mihomo_state).await;
-            emit_status(
-                &watcher_app,
-                exit_status,
-                if exit_status == VpnStatus::Error {
-                    "北京服务器 VPN 进程意外退出，请检查日志"
-                } else {
-                    "已断开"
-                },
-                None,
-            );
         });
 
         let mut child = Some(child);
@@ -1250,7 +1410,6 @@ pub async fn disconnect_fortinet_managed(
             )
         };
 
-        let has_managed_child = child.is_some();
         if let Some(mut child) = child {
             if let Some(process_id) = child.id() {
                 terminate_managed_process_group(&sudo_password, process_id).await;
@@ -1267,9 +1426,8 @@ pub async fn disconnect_fortinet_managed(
             let _ = tokio::fs::remove_file(config_path).await;
         }
 
-        if !has_managed_child {
-            let _ = run_sudo_command(&sudo_password, "killall", &["openfortivpn"]).await;
-        }
+        // 兜底回收自动重试窗口内可能尚未登记到 manager 的引擎进程。
+        let _ = run_sudo_command(&sudo_password, "killall", &["openfortivpn"]).await;
         if let Some(gateway_host) = gateway_host {
             remove_gateway_route(&sudo_password, &gateway_host).await;
         }
@@ -1299,13 +1457,30 @@ pub async fn disconnect_fortinet(
 mod tests {
     use super::{
         is_mihomo_fake_ip, is_physical_interface, route_destination, route_matches_primary_network,
-        routed_ipv4_destination, PrimaryNetworkState,
+        routed_ipv4_destination, FortinetAttemptSignals, Ordering, PrimaryNetworkState,
     };
 
     /** 验证 CIDR 路由可提取 route get 所需的目标地址。 */
     #[test]
     fn extracts_route_destination() {
         assert_eq!(route_destination("192.168.100.0/24"), "192.168.100.0");
+    }
+
+    /** 只有认证成功与隧道就绪的关键日志行才会触发自动重试信号。 */
+    #[test]
+    fn records_engine_progress_signals() {
+        let signals = FortinetAttemptSignals::default();
+        signals.record("DEBUG:  Resolving gateway host ip");
+        signals.record("ERROR:  SSL_connect: error:00000000:lib(0)::reason(0)");
+        assert!(!signals.authenticated.load(Ordering::Relaxed));
+        assert!(!signals.tunnel_up.load(Ordering::Relaxed));
+
+        signals.record("INFO:   Authenticated.");
+        assert!(signals.authenticated.load(Ordering::Relaxed));
+        assert!(!signals.tunnel_up.load(Ordering::Relaxed));
+
+        signals.record("INFO:   Tunnel is up and running.");
+        assert!(signals.tunnel_up.load(Ordering::Relaxed));
     }
 
     /** 验证只有真实物理接口可被选为动态公网出口。 */

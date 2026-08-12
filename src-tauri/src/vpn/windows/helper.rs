@@ -49,6 +49,13 @@ const APP_DATA_DIRECTORY: &str = "cn.yuyan.swiftvpn";
 const FORTINET_TRUSTED_CERT: &str =
     "491a5bbe4cc44c3e42141d9babfbdd29eee75aaf36401221a1dac9305c846b56";
 /**
+ * FortiGate 偶发在认证成功后立即重置首个会话（网关侧旧会话清理竞态），
+ * 引擎会在隧道建立前退出。凭据已验证通过，自动重试不会触发账号锁定。
+ */
+const FORTINET_MAX_AUTO_RETRIES: u32 = 2;
+/** 自动重试前等待网关清理上一个半开会话的时间。 */
+const FORTINET_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+/**
  * 管道只允许本机 SYSTEM、管理员和交互式登录用户访问，并把完整性标签降为 Medium。
  * 随机管道名与 128 位会话令牌仍是命令授权边界；该 ACL 只解决同一用户中/高完整性进程互通。
  */
@@ -143,11 +150,21 @@ impl Default for EngineRuntime {
     }
 }
 
+/** Fortinet 自动重试所需的连接材料与本轮进度信号；仅存于管理员进程内存。 */
+struct FortinetRetryContext {
+    config: VpnConfig,
+    password: String,
+    attempts: u32,
+    authenticated: bool,
+}
+
 /** UAC helper 的完整内存状态。 */
 #[derive(Default)]
 struct HelperState {
     fortinet: EngineRuntime,
     atrust: EngineRuntime,
+    fortinet_retry: Option<FortinetRetryContext>,
+    job: Option<Arc<JobHandle>>,
     logs: VecDeque<HelperLog>,
     next_log_sequence: u64,
     auth_prompt: Option<String>,
@@ -265,6 +282,7 @@ pub async fn run(pipe_name: String, token: String, parent_pid: u32) -> Result<()
     super::append_helper_diagnostic("helper 初始化隐藏控制台完成");
     let job = Arc::new(JobHandle::new()?);
     let state = Arc::new(Mutex::new(HelperState::default()));
+    state.lock().await.job = Some(job.clone());
     let (parent_exit_tx, mut parent_exit_rx) = tokio::sync::oneshot::channel::<()>();
     monitor_parent(parent_pid, parent_exit_tx)?;
     let mut pipe_security = PipeSecurity::new()?;
@@ -304,6 +322,11 @@ pub async fn run(pipe_name: String, token: String, parent_pid: u32) -> Result<()
         }
     }
 
+    {
+        let mut guard = state.lock().await;
+        guard.shutting_down = true;
+        guard.fortinet_retry = None;
+    }
     shutdown_all(&state).await;
     super::append_helper_diagnostic("helper 已完成 VPN 子进程与路由清理");
     Ok(())
@@ -443,11 +466,18 @@ async fn execute_command(
             }
         }
         HelperCommand::Disconnect { vpn_type } => {
+            if vpn_type == VpnType::Fortinet {
+                state.lock().await.fortinet_retry = None;
+            }
             disconnect_engine(state, vpn_type).await.map(|_| false)
         }
         HelperCommand::SubmitMfa { code } => submit_mfa(state, code).await.map(|_| false),
         HelperCommand::Shutdown => {
-            state.lock().await.shutting_down = true;
+            {
+                let mut guard = state.lock().await;
+                guard.shutting_down = true;
+                guard.fortinet_retry = None;
+            }
             shutdown_all(state).await;
             Ok(true)
         }
@@ -493,8 +523,28 @@ async fn connect_fortinet(
             routes: config.custom_routes.clone(),
             ..EngineRuntime::default()
         };
+        guard.fortinet_retry = Some(FortinetRetryContext {
+            config: config.clone(),
+            password: password.clone(),
+            attempts: 0,
+            authenticated: false,
+        });
     }
 
+    let result = start_fortinet_process(state, job, config, password).await;
+    if result.is_err() {
+        state.lock().await.fortinet_retry = None;
+    }
+    result
+}
+
+/** 拉起 Windows openfortivpn 进程；调用前需已设置 Connecting 状态与路由列表。 */
+async fn start_fortinet_process(
+    state: &Arc<Mutex<HelperState>>,
+    job: &Arc<JobHandle>,
+    config: VpnConfig,
+    password: String,
+) -> Result<(), String> {
     let binary = engine_path("openfortivpn.exe")?;
     ensure_engine_files(&binary, true)?;
     let engine_directory = engine_directory()?;
@@ -555,6 +605,85 @@ async fn connect_fortinet(
     }
     spawn_log_watchers(VpnType::Fortinet, stdout, stderr, state.clone());
     Ok(())
+}
+
+/** 根据认证进度决定 Fortinet 失败后自动重试还是进入最终错误清理。 */
+async fn handle_fortinet_failure(state: &Arc<Mutex<HelperState>>) {
+    let retry = {
+        let mut guard = state.lock().await;
+        if guard.shutting_down || guard.fortinet.cleanup_scheduled {
+            None
+        } else {
+            match guard.fortinet_retry.as_mut() {
+                Some(context)
+                    if context.authenticated && context.attempts < FORTINET_MAX_AUTO_RETRIES =>
+                {
+                    context.attempts += 1;
+                    Some((
+                        context.config.clone(),
+                        context.password.clone(),
+                        context.attempts,
+                    ))
+                }
+                _ => None,
+            }
+        }
+    };
+    let Some((config, password, attempt)) = retry else {
+        schedule_error_cleanup(state.clone(), VpnType::Fortinet).await;
+        return;
+    };
+
+    state.lock().await.push_log(
+        VpnType::Fortinet,
+        format!(
+            "Fortinet 引擎在隧道就绪前退出（网关重置旧会话），{} 秒后自动重试（第 {attempt}/{FORTINET_MAX_AUTO_RETRIES} 次）",
+            FORTINET_RETRY_DELAY.as_secs()
+        ),
+    );
+    // 回收残留进程与路由，随后恢复为对 UI 可见的连接中状态。
+    let _ = disconnect_engine(state, VpnType::Fortinet).await;
+    {
+        let mut guard = state.lock().await;
+        if guard.shutting_down || guard.fortinet_retry.is_none() {
+            return;
+        }
+        guard.fortinet = EngineRuntime {
+            status: VpnStatus::Connecting,
+            routes: config.custom_routes.clone(),
+            ..EngineRuntime::default()
+        };
+    }
+
+    let retry_state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(FORTINET_RETRY_DELAY).await;
+        let job = {
+            let guard = retry_state.lock().await;
+            let still_waiting = !guard.shutting_down
+                && guard.fortinet_retry.is_some()
+                && guard.fortinet.status == VpnStatus::Connecting
+                && guard.fortinet.child.is_none()
+                && !guard.fortinet.cleanup_scheduled;
+            if still_waiting {
+                guard.job.clone()
+            } else {
+                None
+            }
+        };
+        let Some(job) = job else {
+            return;
+        };
+        if let Err(error) = start_fortinet_process(&retry_state, &job, config, password).await {
+            let mut guard = retry_state.lock().await;
+            guard.push_log(
+                VpnType::Fortinet,
+                format!("自动重试拉起 Fortinet 引擎失败: {error}"),
+            );
+            guard.fortinet_retry = None;
+            guard.fortinet.status = VpnStatus::Error;
+        }
+    });
 }
 
 /** 启动 Windows zju-connect；敏感 TOML 只写入当前用户临时目录并快速删除。 */
@@ -716,6 +845,11 @@ async fn handle_engine_log(vpn_type: VpnType, text: String, state: &Arc<Mutex<He
 
 /** 处理 openfortivpn 的 JSON 事件，并在 Wintun 就绪后安装精确北京分流路由。 */
 async fn handle_fortinet_log(text: &str, state: &Arc<Mutex<HelperState>>) {
+    if text.contains("Authenticated.") || text.contains("Remote gateway has allocated a VPN") {
+        if let Some(context) = state.lock().await.fortinet_retry.as_mut() {
+            context.authenticated = true;
+        }
+    }
     let Ok(event) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
     };
@@ -744,6 +878,11 @@ async fn handle_fortinet_log(text: &str, state: &Arc<Mutex<HelperState>>) {
                     guard.fortinet.route_gateway = Some(ip);
                     guard.fortinet.installed_routes = installed;
                     guard.fortinet.status = VpnStatus::Connected;
+                    // 隧道成功建立，此后的中断视为新一轮故障，重置重试预算。
+                    if let Some(context) = guard.fortinet_retry.as_mut() {
+                        context.attempts = 0;
+                        context.authenticated = true;
+                    }
                 }
                 Err(error) => {
                     let mut guard = state.lock().await;
@@ -760,6 +899,12 @@ async fn handle_fortinet_log(text: &str, state: &Arc<Mutex<HelperState>>) {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
             let mut guard = state.lock().await;
+            // 引擎仅在认证并取得 VPN 配置后才进入 connected，可作为安全重试信号。
+            if state_name == "connected" {
+                if let Some(context) = guard.fortinet_retry.as_mut() {
+                    context.authenticated = true;
+                }
+            }
             if guard.fortinet.status != VpnStatus::Error {
                 guard.fortinet.status = match state_name {
                     "disconnecting" => VpnStatus::Disconnecting,
@@ -768,9 +913,12 @@ async fn handle_fortinet_log(text: &str, state: &Arc<Mutex<HelperState>>) {
                 };
             }
         }
-        Some("error") | Some("cert_error") => {
+        Some("cert_error") => {
             state.lock().await.fortinet.status = VpnStatus::Error;
             schedule_error_cleanup(state.clone(), VpnType::Fortinet).await;
+        }
+        Some("error") => {
+            handle_fortinet_failure(state).await;
         }
         Some("transport_down") => {
             if let Some(reason) = event.get("reason").and_then(serde_json::Value::as_str) {
@@ -964,13 +1112,17 @@ async fn schedule_error_cleanup(state: Arc<Mutex<HelperState>>, vpn_type: VpnTyp
             VpnType::Fortinet => &mut guard.fortinet,
             VpnType::Atrust => &mut guard.atrust,
         };
-        if engine.cleanup_scheduled {
+        let should_schedule = if engine.cleanup_scheduled {
             false
         } else {
             engine.cleanup_scheduled = true;
             engine.status = VpnStatus::Error;
             true
+        };
+        if vpn_type == VpnType::Fortinet {
+            guard.fortinet_retry = None;
         }
+        should_schedule
     };
     if !should_schedule {
         return;
@@ -1009,6 +1161,11 @@ async fn refresh_exited_children(state: &Arc<Mutex<HelperState>>) {
             exited.then_some(engine.status)
         };
         if let Some(previous_status) = previous_status {
+            // Fortinet 进程在隧道就绪前意外退出时，由重试仲裁决定自动重连或错误清理。
+            if vpn_type == VpnType::Fortinet && previous_status != VpnStatus::Disconnecting {
+                handle_fortinet_failure(state).await;
+                continue;
+            }
             let _ = disconnect_engine(state, vpn_type).await;
             if previous_status != VpnStatus::Disconnecting {
                 let mut guard = state.lock().await;
