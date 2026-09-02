@@ -13,6 +13,7 @@ import type { UpdateState } from '../constant';
 import {
   AUTO_CHECK_INTERVAL_MS,
   INITIAL_CHECK_DELAY_MS,
+  INSTALL_REVALIDATION_RETRY_DELAYS_MS,
   SILENT_DOWNLOAD_RETRY_DELAYS_MS,
 } from '../constant';
 
@@ -127,6 +128,43 @@ const getUpdateAssetFingerprint = (update: Update): string => {
 const isSameUpdateResource = (left: Update, right: Update): boolean => {
   return left.version === right.version
     && getUpdateAssetFingerprint(left) === getUpdateAssetFingerprint(right);
+};
+
+/** 等待指定时间后继续更新流程。 */
+const waitForUpdateRetry = (delayMs: number): Promise<void> => {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+};
+
+/**
+ * 安装前复核更新清单，并自动吸收 GitHub Release 链路的瞬时网络失败。
+ * @returns 最新可用更新；当前已是最新版本时返回 `null`
+ */
+const checkReadyUpdateWithRetry = async (): Promise<Update | null> => {
+  let lastError: unknown;
+  const maxAttempts = INSTALL_REVALIDATION_RETRY_DELAYS_MS.length + 1;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      return await check({ timeout: 15_000 });
+    } catch (error) {
+      lastError = error;
+      const retryDelay = INSTALL_REVALIDATION_RETRY_DELAYS_MS[attempt];
+      if (retryDelay === undefined) break;
+
+      console.warn(
+        `[Update] 安装前清单复核第 ${attempt + 1} 次失败，${retryDelay}ms 后重试:`,
+        error,
+      );
+      message.loading({
+        content: `更新信息暂时无法确认，正在重试（${attempt + 2}/${maxAttempts}）...`,
+        duration: 0,
+        key: 'app-update-install',
+      });
+      await waitForUpdateRetry(retryDelay);
+    }
+  }
+
+  throw lastError ?? new Error('更新清单复核失败');
 };
 
 /** 用最新清单资源替换当前待安装资源。 */
@@ -273,7 +311,7 @@ const revalidateReadyUpdate = async (): Promise<boolean> => {
   const currentGeneration = updateResourceGeneration;
   if (!currentUpdate) return false;
 
-  const refreshedUpdate = await check({ timeout: 15_000 });
+  const refreshedUpdate = await checkReadyUpdateWithRetry();
   if (!refreshedUpdate) {
     await clearPendingUpdate();
     message.warning({
@@ -308,8 +346,9 @@ const installReadyUpdate = async () => {
 
   updateCheckGeneration += 1;
   updateState.value.status = 'installing';
+  updateState.value.error = null;
   hasUpdate.value = false;
-  let vpnCleanupCompleted = false;
+
   try {
     message.loading({
       content: `正在确认 ${formatVersion(latestVersion.value)} 仍为有效更新...`,
@@ -317,7 +356,22 @@ const installReadyUpdate = async () => {
       key: 'app-update-install',
     });
     if (!await revalidateReadyUpdate()) return;
+  } catch (error) {
+    const errorMessage = getErrorMessage(error);
+    console.error('[Update] 安装前清单复核失败:', error);
+    updateState.value.status = 'completed';
+    updateState.value.error = errorMessage;
+    hasUpdate.value = true;
+    message.error({
+      content: `更新信息复核失败，已保留安装包，请稍后重试：${errorMessage}`,
+      duration: 8,
+      key: 'app-update-install',
+    });
+    return;
+  }
 
+  let vpnCleanupCompleted = false;
+  try {
     const installableUpdate = pendingUpdate;
     if (!installableUpdate) throw new Error('已验证更新资源已失效，请重新检查更新');
     message.loading({

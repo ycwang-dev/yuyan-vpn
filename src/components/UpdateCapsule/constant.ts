@@ -85,3 +85,9 @@ export const SILENT_DOWNLOAD_RETRY_DELAYS_MS = [
   5 * 60 * 1000,
   15 * 60 * 1000,
 ] as const;
+
+/** 安装前复核更新清单失败后的短阶梯重试间隔（毫秒） */
+export const INSTALL_REVALIDATION_RETRY_DELAYS_MS = [
+  500,
+  1500,
+] as const;
